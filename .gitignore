@@ -1,0 +1,30 @@
+# 编译产物
+/target/
+/unicom
+
+# Node
+node_modules/
+dist/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Database
+*.db
+*.db-journal
+
+# Logs
+*.log
+
+# 个人工具
+/sync.sh
+/build_remote.sh
+
+# 运行时配置
+/config.toml
+/unicom.service

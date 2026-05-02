@@ -1,0 +1,59 @@
+[package]
+name = "unicom"
+version = "1.0.0"
+edition = "2021"
+description = "联通流量查询系统 - Rust 版本"
+build = "src/build.rs"
+
+[dependencies]
+# Web 框架
+actix-web = "4"
+actix-rt = "2"
+actix-cors = "0.7"
+
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 数据库
+rusqlite = { version = "0.31", features = ["bundled", "chrono"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.24"
+
+# HTTP 客户端
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
+
+# 异步运行时
+tokio = { version = "1", features = ["full"] }
+
+# 定时任务
+tokio-cron-scheduler = "0.11"
+
+# 日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# 时间处理
+chrono = { version = "0.4", features = ["serde"] }
+
+# 配置
+config = "0.14"
+
+# 错误处理
+anyhow = "1"
+
+# 密码哈希
+bcrypt = "0.15"
+
+# UUID
+uuid = { version = "1", features = ["v4"] }
+
+# 优化编译速度
+[profile.dev]
+opt-level = 0
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+codegen-units = 1

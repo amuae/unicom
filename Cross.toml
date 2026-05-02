@@ -1,0 +1,13 @@
+# Cross-compilation configuration
+
+# Android ARM64
+[target.aarch64-linux-android]
+pre-build = [
+    "dpkg --add-architecture arm64",
+    "apt-get update",
+    "apt-get install -y libssl-dev:arm64"
+]
+
+# ARM64 Linux (default linker works with cross)
+
+# Windows (uses MinGW for x86_64)
