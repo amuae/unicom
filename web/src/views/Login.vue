@@ -438,7 +438,10 @@ async function openConfigModal() {
       query_password: c.query_password || '', auth_type: c.auth_type || 'token_online',
       appid: c.appid || '', token_online: c.token_online || '', cookie: c.cookie || '',
     })
-    try { Object.assign(notifyParams, JSON.parse(c.notify_params || '{}')) } catch { /* ignore */ }
+    try {
+      const np = c.notify_params
+      Object.assign(notifyParams, typeof np === 'string' ? JSON.parse(np || '{}') : (np || {}))
+    } catch { /* ignore */ }
     activeTab.value = 'notify'
     showModal.value = true
   } catch (e: any) {

@@ -47,7 +47,9 @@ pub async fn get_user_config(
                 "token": row.get::<_, String>(7)?,
                 "notify_enabled": row.get::<_, i32>(8)?,
                 "notify_type": row.get::<_, String>(9)?,
-                "notify_params": row.get::<_, String>(10)?,
+                "notify_params": serde_json::from_str::<serde_json::Value>(
+                    &row.get::<_, String>(10)?
+                ).unwrap_or(serde_json::Value::Null),
                 "notify_threshold": row.get::<_, i32>(11)?,
                 "query_interval": row.get::<_, i32>(12)?,
             }))
@@ -119,8 +121,13 @@ pub async fn update_user_config(
         params.push(Box::new(notify_type.clone()));
     }
     if let Some(notify_params) = &body.notify_params {
+        // 兼容前端发来 JSON 对象或 JSON 字符串，避免双重转义
+        let params_str = match notify_params {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
         updates.push("notify_params = ?");
-        params.push(Box::new(notify_params.to_string()));
+        params.push(Box::new(params_str));
     }
     if let Some(threshold) = body.notify_threshold {
         updates.push("notify_threshold = ?");
