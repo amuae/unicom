@@ -38,14 +38,34 @@ fn get_pid() -> Option<u32> {
     let pid_file = format!("{}/unicom.pid", get_install_dir());
     if let Ok(content) = std::fs::read_to_string(&pid_file) {
         if let Ok(pid) = content.trim().parse::<u32>() {
-            if std::process::Command::new("kill")
-                .args(["-0", &pid.to_string()])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .is_ok()
+            #[cfg(target_os = "windows")]
             {
-                return Some(pid);
+                // Windows: check if process exists via tasklist
+                let output = std::process::Command::new("tasklist")
+                    .args(["/FI", &format!("PID eq {}", pid), "/NH"])
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null())
+                    .output();
+                if let Ok(out) = output {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    // tasklist returns "INFO: no tasks running" if not found
+                    if stdout.contains(&pid.to_string()) {
+                        return Some(pid);
+                    }
+                }
+                return None;
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                if std::process::Command::new("kill")
+                    .args(["-0", &pid.to_string()])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok()
+                {
+                    return Some(pid);
+                }
             }
         }
     }
@@ -98,6 +118,8 @@ fn cmd_status() {
         Some(pid) => {
             println!("  状态: ✅ 运行中 (PID: {})", pid);
             
+            #[cfg(not(target_os = "windows"))]
+            {
             // 读取 /proc/[pid]/status 获取资源信息
             let status_path = format!("/proc/{}/status", pid);
             let stat_path = format!("/proc/{}/stat", pid);
@@ -193,6 +215,7 @@ fn cmd_status() {
                     }
                 }
             }
+            } // end #[cfg(not(target_os = "windows"))]
         }
         None => println!("  状态: ❌ 未运行"),
     }
@@ -222,16 +245,46 @@ fn cmd_start() {
 
     println!("启动服务...");
     let install_dir = get_install_dir();
-    let exe = format!("{}/unicom", install_dir);
-    std::process::Command::new(&exe)
-        .current_dir(&install_dir)
-        .spawn()
-        .expect("Failed to start");
-    std::thread::sleep(std::time::Duration::from_secs(1));
-    if is_running() {
-        println!("✅ 启动成功 (PID: {})", get_pid().unwrap());
-    } else {
-        println!("❌ 启动失败，请查看日志");
+    #[cfg(target_os = "windows")]
+    {
+        let exe = format!("{}/unicom.exe", install_dir);
+        // Windows: use CREATE_NO_WINDOW to detach from console
+        use std::os::windows::process::CommandExt;
+        let result = std::process::Command::new(&exe)
+            .current_dir(&install_dir)
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
+            .stdin(std::process::Stdio::null())  // 关键：让 is_terminal() 返回 false，跳过交互菜单
+            .spawn();
+        match result {
+            Ok(child) => {
+                // Write PID manually since we can't rely on kill -0 check
+                std::fs::write(format!("{}/unicom.pid", install_dir), child.id().to_string()).ok();
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                if is_running() {
+                    println!("✅ 启动成功 (PID: {})", child.id());
+                } else {
+                    println!("❌ 启动失败，请查看日志");
+                }
+            }
+            Err(e) => {
+                println!("❌ 启动失败: {}", e);
+                println!("  确保 unicom.exe 在 {} 目录下", install_dir);
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let exe = format!("{}/unicom", install_dir);
+        std::process::Command::new(&exe)
+            .current_dir(&install_dir)
+            .spawn()
+            .expect("Failed to start");
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        if is_running() {
+            println!("✅ 启动成功 (PID: {})", get_pid().unwrap());
+        } else {
+            println!("❌ 启动失败，请查看日志");
+        }
     }
 }
 
@@ -245,7 +298,6 @@ fn cmd_stop() {
             .status()
             .ok();
         std::thread::sleep(std::time::Duration::from_secs(1));
-        // 清理 PID 文件（service.d 脚本可能已清理）
         let pid_file = format!("{}/unicom.pid", get_install_dir());
         std::fs::remove_file(&pid_file).ok();
         if !is_running() {
@@ -259,21 +311,34 @@ fn cmd_stop() {
     match get_pid() {
         Some(pid) => {
             println!("停止服务 (PID: {})...", pid);
-            // 先尝试 SIGTERM
-            std::process::Command::new("kill")
-                .arg(pid.to_string())
-                .status()
-                .ok();
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            // 如果还在运行，用 SIGKILL
-            if is_running() {
-                println!("SIGTERM 无效，尝试 SIGKILL...");
-                std::process::Command::new("kill")
-                    .args(["-9", &pid.to_string()])
+            #[cfg(target_os = "windows")]
+            {
+                // Windows: use taskkill
+                std::process::Command::new("taskkill")
+                    .args(["/PID", &pid.to_string(), "/F"])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
                     .status()
                     .ok();
-                std::thread::sleep(std::time::Duration::from_secs(1));
             }
+            #[cfg(not(target_os = "windows"))]
+            {
+                // 先尝试 SIGTERM
+                std::process::Command::new("kill")
+                    .arg(pid.to_string())
+                    .status()
+                    .ok();
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                // 如果还在运行，用 SIGKILL
+                if is_running() {
+                    println!("SIGTERM 无效，尝试 SIGKILL...");
+                    std::process::Command::new("kill")
+                        .args(["-9", &pid.to_string()])
+                        .status()
+                        .ok();
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
             if !is_running() {
                 let pid_file = format!("{}/unicom.pid", get_install_dir());
                 std::fs::remove_file(&pid_file).ok();
@@ -426,18 +491,27 @@ fn do_update() {
     println!("\n=== 更新 Unicom ===");
     println!("安装目录: {}", install_dir);
     println!();
-    println!("请执行以下命令更新:");
-    println!("  curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/amuae/unicom/main/deploy.sh | sh");
-    println!();
-    print!("是否现在执行？(y/N): ");
-    io::stdout().flush().unwrap();
+    #[cfg(target_os = "windows")]
+    {
+        println!("请在 PowerShell 中执行以下命令更新:");
+        println!("  irm https://ghfast.top/https://raw.githubusercontent.com/amuae/unicom/main/deploy.ps1 | iex");
+        println!("或手动下载: https://github.com/amuae/unicom/releases/latest");
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        println!("请执行以下命令更新:");
+        println!("  curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/amuae/unicom/main/deploy.sh | sh");
+        println!();
+        print!("是否现在执行？(y/N): ");
+        io::stdout().flush().unwrap();
 
-    if read_line().to_lowercase() == "y" {
-        println!("正在更新...");
-        std::process::Command::new("sh")
-            .args(["-c", "curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/amuae/unicom/main/deploy.sh | sh"])
-            .status()
-            .ok();
+        if read_line().to_lowercase() == "y" {
+            println!("正在更新...");
+            std::process::Command::new("sh")
+                .args(["-c", "curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/amuae/unicom/main/deploy.sh | sh"])
+                .status()
+                .ok();
+        }
     }
 }
 
@@ -521,7 +595,10 @@ async fn main() -> std::io::Result<()> {
     // 有参数：快捷指令模式
     if args.len() > 1 {
         match args[1].as_str() {
-            "start" => cmd_start(),
+            "start" => {
+                cmd_start();
+                std::process::exit(0);
+            }
             "stop" => cmd_stop(),
             "restart" => cmd_restart(),
             "status" => cmd_status(),
