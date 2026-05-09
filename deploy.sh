@@ -148,23 +148,19 @@ wait_and_register() {
         return 1
     fi
 
-    # 生成随机账号密码
-    local username=$(generate_random_string 10)
-    local password=$(generate_random_string 10)
-
+    # 直接用 reset-pass 写数据库（WAL 模式，不需要停服务）
     log_step "注册管理员账号..." >&2
-    local resp=$(curl -s -w "\n%{http_code}" -X POST "http://127.0.0.1:${port}/auth/register" \
-        -H "Content-Type: application/json" \
-        -d "{\"username\":\"${username}\",\"password\":\"${password}\"}" 2>&1)
-    local http_code=$(echo "$resp" | tail -1)
-    local body=$(echo "$resp" | sed '$d')
+    local output
+    output=$("${INSTALL_DIR}/unicom" reset-pass 2>&1)
 
-    if echo "$body" | grep -q "注册成功"; then
-        echo "${username}"
-        echo "${password}"
+    if echo "$output" | grep -q "已重置"; then
+        local username=$(echo "$output" | grep "用户名:" | sed 's/.*用户名:\s*//')
+        local password=$(echo "$output" | grep "密码:" | sed 's/.*密码:\s*//')
+        echo "$username"
+        echo "$password"
         return 0
     else
-        log_warn "自动注册失败 (HTTP ${http_code}): ${body}" >&2
+        log_warn "自动注册失败: ${output}" >&2
         return 1
     fi
 }

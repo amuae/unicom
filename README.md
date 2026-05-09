@@ -23,19 +23,29 @@ curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/amuae/unicom/mai
 ### Windows
 
 ```powershell
-$dir = "$env:LOCALAPPDATA\unicom"
-New-Item -ItemType Directory -Force -Path $dir | Out-Null
-Invoke-WebRequest -Uri "https://ghfast.top/https://github.com/amuae/unicom/releases/latest/download/unicom_windows-amd64.zip" -OutFile "$dir\unicom.zip"
-Expand-Archive -Path "$dir\unicom.zip" -DestinationPath $dir -Force
-Remove-Item "$dir\unicom.zip"
-cd $dir
-.\unicom.exe
+irm https://ghfast.top/https://raw.githubusercontent.com/amuae/unicom/main/deploy.ps1 | iex
+```
+
+自动安装到 `%LOCALAPPDATA%\unicom`，配置开机自启，注册管理员账号。
+
+## 一键卸载
+
+### Linux / Android
+
+```bash
+curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/amuae/unicom/main/uninstall.sh | sudo bash
+```
+
+### Windows
+
+```powershell
+irm https://ghfast.top/https://raw.githubusercontent.com/amuae/unicom/main/uninstall.ps1 | iex
 ```
 
 ## 快捷命令
 
 ```bash
-unicom start       # 启动服务
+unicom start       # 启动服务（后台运行）
 unicom stop        # 停止服务
 unicom restart     # 重启服务
 unicom status      # 查看状态（PID、内存、端口）
@@ -43,6 +53,8 @@ unicom reset-pass  # 重置管理员账密（随机生成）
 unicom version     # 显示版本
 unicom help        # 显示帮助
 ```
+
+Windows 下为 `unicom.exe`，用法相同。
 
 ## 交互菜单
 

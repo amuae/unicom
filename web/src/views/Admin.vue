@@ -557,7 +557,10 @@ const loadUserNotifyConfig = async (userToken: string) => {
       notifyForm.query_interval = c.query_interval || 30
       notifyForm.notify_title = c.notify_title || '联通流量提醒'
       notifyForm.notify_content = c.notify_content || ''
-      try { Object.assign(notifyParams, JSON.parse(c.notify_params || '{}')) } catch { /* ignore */ }
+      try {
+        const np = c.notify_params
+        Object.assign(notifyParams, typeof np === 'string' ? JSON.parse(np || '{}') : (np || {}))
+      } catch { /* ignore */ }
     }
   } catch { /* ignore */ }
 }

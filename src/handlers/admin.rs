@@ -207,7 +207,9 @@ pub async fn get_user_detail(
                 "token": row.get::<_, String>(16)?,
                 "notify_enabled": row.get::<_, i32>(17)?,
                 "notify_type": row.get::<_, String>(18)?,
-                "notify_params": row.get::<_, String>(19)?,
+                "notify_params": serde_json::from_str::<serde_json::Value>(
+                    &row.get::<_, String>(19)?
+                ).unwrap_or(serde_json::Value::Null),
                 "notify_title": row.get::<_, String>(20)?,
                 "notify_subtitle": row.get::<_, String>(21)?,
                 "notify_content": row.get::<_, String>(22)?,
