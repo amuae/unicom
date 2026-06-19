@@ -28,7 +28,7 @@ jobs:
       tag: ${{ steps.calc.outputs.tag }}
       should_release: ${{ steps.calc.outputs.should_release }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Calculate version
         id: calc
@@ -78,10 +78,10 @@ jobs:
     needs: resolve-version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@v6
         with:
           node-version: '24'
 
@@ -129,7 +129,7 @@ jobs:
     name: Build (${{ matrix.name }})
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Restore frontend dist
         uses: actions/cache/restore@v5
@@ -221,7 +221,7 @@ jobs:
           cd ../../..
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: unicom_${{ matrix.name }}
           path: unicom_${{ matrix.name }}.*
@@ -236,13 +236,13 @@ jobs:
 
     steps:
       - name: Download release artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           path: artifacts/
           pattern: unicom_*
 
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.resolve-version.outputs.tag }}
           name: "Unicom ${{ needs.resolve-version.outputs.version }}"
