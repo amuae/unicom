@@ -48,6 +48,9 @@ bcrypt = "0.15"
 # UUID
 uuid = { version = "1", features = ["v4"] }
 
+# 安全随机数
+rand = "0.8"
+
 # 优化编译速度
 [profile.dev]
 opt-level = 0

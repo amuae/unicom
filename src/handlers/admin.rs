@@ -1,8 +1,9 @@
-use actix_web::{get, post, put, delete, web, HttpResponse};
+use actix_web::{get, post, put, delete, web, HttpRequest, HttpResponse};
 use serde::{Deserialize, Serialize};
 use bcrypt::{hash, verify, DEFAULT_COST};
 
 use crate::AppState;
+use crate::handlers::auth::verify_admin_token;
 
 #[derive(Serialize)]
 pub struct AdminResponse {
@@ -134,14 +135,30 @@ where
 #[get("/admin/users")]
 pub async fn get_users(
     state: web::Data<AppState>,
+    req: HttpRequest,
 ) -> HttpResponse {
-    let db = state.db.get().unwrap();
+    let _admin_id = match verify_admin_token(&state, &req) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
 
-    let mut stmt = db.prepare(
+    let db = match state.db.get() {
+        Ok(db) => db,
+        Err(_) => return HttpResponse::InternalServerError().json(AdminResponse {
+            success: false, data: None, error: Some("数据库连接失败".to_string()), total: None,
+        }),
+    };
+
+    let mut stmt = match db.prepare(
         "SELECT id, mobile, nickname, auth_type, status, token, notify_enabled, notify_type, \
          query_interval, last_query_at, created_at \
          FROM users ORDER BY created_at DESC"
-    ).unwrap();
+    ) {
+        Ok(s) => s,
+        Err(e) => return HttpResponse::InternalServerError().json(AdminResponse {
+            success: false, data: None, error: Some(format!("查询失败: {}", e)), total: None,
+        }),
+    };
 
     let users: Vec<serde_json::Value> = stmt.query_map([], |row| {
         Ok(serde_json::json!({
@@ -174,9 +191,20 @@ pub async fn get_users(
 pub async fn get_user_detail(
     state: web::Data<AppState>,
     path: web::Path<i64>,
+    req: HttpRequest,
 ) -> HttpResponse {
+    let _admin_id = match verify_admin_token(&state, &req) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+
     let user_id = path.into_inner();
-    let db = state.db.get().unwrap();
+    let db = match state.db.get() {
+        Ok(db) => db,
+        Err(_) => return HttpResponse::InternalServerError().json(AdminResponse {
+            success: false, data: None, error: Some("数据库连接失败".to_string()), total: None,
+        }),
+    };
 
     let result = db.query_row(
         "SELECT id, mobile, nickname, query_password, auth_type, appid, token_online, \
@@ -222,16 +250,10 @@ pub async fn get_user_detail(
 
     match result {
         Ok(user) => HttpResponse::Ok().json(AdminResponse {
-            success: true,
-            data: Some(user),
-            error: None,
-            total: None,
+            success: true, data: Some(user), error: None, total: None,
         }),
-        Err(_) => HttpResponse::Ok().json(AdminResponse {
-            success: false,
-            data: None,
-            error: Some("用户不存在".to_string()),
-            total: None,
+        Err(_) => HttpResponse::NotFound().json(AdminResponse {
+            success: false, data: None, error: Some("用户不存在".to_string()), total: None,
         }),
     }
 }
@@ -240,28 +262,36 @@ pub async fn get_user_detail(
 pub async fn add_user(
     state: web::Data<AppState>,
     body: web::Json<AddUserRequest>,
+    req: HttpRequest,
 ) -> HttpResponse {
-    let db = state.db.get().unwrap();
-    
+    let _admin_id = match verify_admin_token(&state, &req) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+
+    let db = match state.db.get() {
+        Ok(db) => db,
+        Err(_) => return HttpResponse::InternalServerError().json(AdminResponse {
+            success: false, data: None, error: Some("数据库连接失败".to_string()), total: None,
+        }),
+    };
+
     // 检查手机号是否已存在
     let exists: bool = db.query_row(
         "SELECT COUNT(*) FROM users WHERE mobile = ?1",
         rusqlite::params![body.mobile],
         |row| row.get::<_, i64>(0),
     ).unwrap_or(0) > 0;
-    
+
     if exists {
-        return HttpResponse::Ok().json(AdminResponse {
-            success: false,
-            data: None,
-            error: Some("手机号已存在".to_string()),
-            total: None,
+        return HttpResponse::Conflict().json(AdminResponse {
+            success: false, data: None, error: Some("手机号已存在".to_string()), total: None,
         });
     }
-    
+
     // 生成 token
     let token = uuid::Uuid::new_v4().to_string();
-    
+
     let result = db.execute(
         "INSERT INTO users (mobile, nickname, query_password, auth_type, cookie, appid, token_online, token, status, \
          today_query_data, last_query_data) \
@@ -277,19 +307,13 @@ pub async fn add_user(
             token,
         ],
     );
-    
+
     match result {
-        Ok(_) => HttpResponse::Ok().json(AdminResponse {
-            success: true,
-            data: Some(serde_json::json!({"message": "添加成功"})),
-            error: None,
-            total: None,
+        Ok(_) => HttpResponse::Created().json(AdminResponse {
+            success: true, data: Some(serde_json::json!({"message": "添加成功"})), error: None, total: None,
         }),
-        Err(e) => HttpResponse::Ok().json(AdminResponse {
-            success: false,
-            data: None,
-            error: Some(format!("添加失败: {}", e)),
-            total: None,
+        Err(e) => HttpResponse::InternalServerError().json(AdminResponse {
+            success: false, data: None, error: Some(format!("添加失败: {}", e)), total: None,
         }),
     }
 }
@@ -298,13 +322,24 @@ pub async fn add_user(
 pub async fn update_user(
     state: web::Data<AppState>,
     body: web::Json<UpdateUserRequest>,
+    req: HttpRequest,
 ) -> HttpResponse {
-    let db = state.db.get().unwrap();
-    
+    let _admin_id = match verify_admin_token(&state, &req) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+
+    let db = match state.db.get() {
+        Ok(db) => db,
+        Err(_) => return HttpResponse::InternalServerError().json(AdminResponse {
+            success: false, data: None, error: Some("数据库连接失败".to_string()), total: None,
+        }),
+    };
+
     let mut updates = Vec::new();
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
     let mut param_idx = 1;
-    
+
     if let Some(ref mobile) = body.mobile {
         updates.push(format!("mobile = ?{}", param_idx));
         params.push(Box::new(mobile.clone()));
@@ -380,54 +415,41 @@ pub async fn update_user(
         params.push(Box::new(notify_content.clone()));
         param_idx += 1;
     }
-    
+
     if updates.is_empty() {
-        return HttpResponse::Ok().json(AdminResponse {
-            success: false,
-            data: None,
-            error: Some("没有要更新的字段".to_string()),
-            total: None,
+        return HttpResponse::BadRequest().json(AdminResponse {
+            success: false, data: None, error: Some("没有要更新的字段".to_string()), total: None,
         });
     }
-    
+
     updates.push(format!("updated_at = datetime('now')"));
-    
+
     let sql = format!(
         "UPDATE users SET {} WHERE id = ?{}",
         updates.join(", "),
         param_idx
     );
     params.push(Box::new(body.id));
-    
+
     let result = db.execute(&sql, rusqlite::params_from_iter(params.iter()));
-    
+
     match result {
         Ok(rows) => {
             if rows > 0 {
-                // 写日志
                 log_to_db(&db, "system", "info",
                     &format!("管理员更新了用户 #{}", body.id),
                     None, None, None);
                 HttpResponse::Ok().json(AdminResponse {
-                    success: true,
-                    data: Some(serde_json::json!({"message": "更新成功"})),
-                    error: None,
-                    total: None,
+                    success: true, data: Some(serde_json::json!({"message": "更新成功"})), error: None, total: None,
                 })
             } else {
-                HttpResponse::Ok().json(AdminResponse {
-                    success: false,
-                    data: None,
-                    error: Some("用户不存在".to_string()),
-                    total: None,
+                HttpResponse::NotFound().json(AdminResponse {
+                    success: false, data: None, error: Some("用户不存在".to_string()), total: None,
                 })
             }
         }
-        Err(e) => HttpResponse::Ok().json(AdminResponse {
-            success: false,
-            data: None,
-            error: Some(format!("更新失败: {}", e)),
-            total: None,
+        Err(e) => HttpResponse::InternalServerError().json(AdminResponse {
+            success: false, data: None, error: Some(format!("更新失败: {}", e)), total: None,
         }),
     }
 }
@@ -436,14 +458,25 @@ pub async fn update_user(
 pub async fn delete_user(
     state: web::Data<AppState>,
     body: web::Json<UserIdRequest>,
+    req: HttpRequest,
 ) -> HttpResponse {
-    let db = state.db.get().unwrap();
-    
+    let _admin_id = match verify_admin_token(&state, &req) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+
+    let db = match state.db.get() {
+        Ok(db) => db,
+        Err(_) => return HttpResponse::InternalServerError().json(AdminResponse {
+            success: false, data: None, error: Some("数据库连接失败".to_string()), total: None,
+        }),
+    };
+
     let result = db.execute(
         "DELETE FROM users WHERE id = ?1",
         rusqlite::params![body.id],
     );
-    
+
     match result {
         Ok(rows) => {
             if rows > 0 {
@@ -451,25 +484,16 @@ pub async fn delete_user(
                     &format!("管理员删除了用户 #{}", body.id),
                     None, None, None);
                 HttpResponse::Ok().json(AdminResponse {
-                    success: true,
-                    data: Some(serde_json::json!({"message": "删除成功"})),
-                    error: None,
-                    total: None,
+                    success: true, data: Some(serde_json::json!({"message": "删除成功"})), error: None, total: None,
                 })
             } else {
-                HttpResponse::Ok().json(AdminResponse {
-                    success: false,
-                    data: None,
-                    error: Some("用户不存在".to_string()),
-                    total: None,
+                HttpResponse::NotFound().json(AdminResponse {
+                    success: false, data: None, error: Some("用户不存在".to_string()), total: None,
                 })
             }
         }
-        Err(e) => HttpResponse::Ok().json(AdminResponse {
-            success: false,
-            data: None,
-            error: Some(format!("删除失败: {}", e)),
-            total: None,
+        Err(e) => HttpResponse::InternalServerError().json(AdminResponse {
+            success: false, data: None, error: Some(format!("删除失败: {}", e)), total: None,
         }),
     }
 }
@@ -478,23 +502,34 @@ pub async fn delete_user(
 pub async fn toggle_user_status(
     state: web::Data<AppState>,
     body: web::Json<UserIdRequest>,
+    req: HttpRequest,
 ) -> HttpResponse {
-    let db = state.db.get().unwrap();
-    
+    let _admin_id = match verify_admin_token(&state, &req) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+
+    let db = match state.db.get() {
+        Ok(db) => db,
+        Err(_) => return HttpResponse::InternalServerError().json(AdminResponse {
+            success: false, data: None, error: Some("数据库连接失败".to_string()), total: None,
+        }),
+    };
+
     // 先获取当前状态
     let current_status: String = db.query_row(
         "SELECT status FROM users WHERE id = ?1",
         rusqlite::params![body.id],
         |row| row.get(0),
     ).unwrap_or_default();
-    
+
     let new_status = if current_status == "active" { "disabled" } else { "active" };
-    
+
     let result = db.execute(
         "UPDATE users SET status = ?1, updated_at = datetime('now') WHERE id = ?2",
         rusqlite::params![new_status, body.id],
     );
-    
+
     match result {
         Ok(rows) => {
             if rows > 0 {
@@ -507,23 +542,16 @@ pub async fn toggle_user_status(
                         "message": if new_status == "active" { "已启用" } else { "已禁用" },
                         "new_status": new_status,
                     })),
-                    error: None,
-                    total: None,
+                    error: None, total: None,
                 })
             } else {
-                HttpResponse::Ok().json(AdminResponse {
-                    success: false,
-                    data: None,
-                    error: Some("用户不存在".to_string()),
-                    total: None,
+                HttpResponse::NotFound().json(AdminResponse {
+                    success: false, data: None, error: Some("用户不存在".to_string()), total: None,
                 })
             }
         }
-        Err(e) => HttpResponse::Ok().json(AdminResponse {
-            success: false,
-            data: None,
-            error: Some(format!("操作失败: {}", e)),
-            total: None,
+        Err(e) => HttpResponse::InternalServerError().json(AdminResponse {
+            success: false, data: None, error: Some(format!("操作失败: {}", e)), total: None,
         }),
     }
 }
@@ -536,8 +564,20 @@ pub async fn toggle_user_status(
 pub async fn get_logs(
     state: web::Data<AppState>,
     query: web::Query<std::collections::HashMap<String, String>>,
+    req: HttpRequest,
 ) -> HttpResponse {
-    let db = state.db.get().unwrap();
+    let _admin_id = match verify_admin_token(&state, &req) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+
+    let db = match state.db.get() {
+        Ok(db) => db,
+        Err(_) => return HttpResponse::InternalServerError().json(AdminResponse {
+            success: false, data: None, error: Some("数据库连接失败".to_string()), total: None,
+        }),
+    };
+
     let limit = query.get("limit").and_then(|l| l.parse::<i64>().ok()).unwrap_or(100);
     let offset = query.get("offset").and_then(|o| o.parse::<i64>().ok()).unwrap_or(0);
     let log_type = query.get("log_type").or_else(|| query.get("type")).map(|s| s.as_str());
@@ -573,7 +613,12 @@ pub async fn get_logs(
     params.push(Box::new(limit));
     params.push(Box::new(offset));
 
-    let mut stmt = db.prepare(&sql).unwrap();
+    let mut stmt = match db.prepare(&sql) {
+        Ok(s) => s,
+        Err(e) => return HttpResponse::InternalServerError().json(AdminResponse {
+            success: false, data: None, error: Some(format!("查询失败: {}", e)), total: None,
+        }),
+    };
 
     let logs: Vec<serde_json::Value> = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
         Ok(serde_json::json!({
@@ -595,7 +640,6 @@ pub async fn get_logs(
     let total: i64 = {
         let count_sql = format!("SELECT COUNT(*) FROM system_logs {}", where_clause);
         if idx > 1 {
-            // Build separate params for count (exclude limit/offset)
             let mut count_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
             if let Some(t) = query.get("log_type").or_else(|| query.get("type")) {
                 count_params.push(Box::new(t.clone()));
@@ -610,18 +654,26 @@ pub async fn get_logs(
     };
 
     HttpResponse::Ok().json(AdminResponse {
-        success: true,
-        data: Some(serde_json::json!(logs)),
-        error: None,
-        total: Some(total),
+        success: true, data: Some(serde_json::json!(logs)), error: None, total: Some(total),
     })
 }
 
 #[get("/admin/logs/config")]
 pub async fn get_log_config(
     state: web::Data<AppState>,
+    req: HttpRequest,
 ) -> HttpResponse {
-    let db = state.db.get().unwrap();
+    let _admin_id = match verify_admin_token(&state, &req) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+
+    let db = match state.db.get() {
+        Ok(db) => db,
+        Err(_) => return HttpResponse::InternalServerError().json(AdminResponse {
+            success: false, data: None, error: Some("数据库连接失败".to_string()), total: None,
+        }),
+    };
 
     let log_level = get_config_value(&db, "log_level").unwrap_or_else(|| "info".to_string());
     let log_retention_days = get_config_value(&db, "log_retention_days").unwrap_or_else(|| "7".to_string());
@@ -632,8 +684,7 @@ pub async fn get_log_config(
             "log_level": log_level,
             "log_retention_days": log_retention_days,
         })),
-        error: None,
-        total: None,
+        error: None, total: None,
     })
 }
 
@@ -641,8 +692,19 @@ pub async fn get_log_config(
 pub async fn save_log_config(
     state: web::Data<AppState>,
     body: web::Json<LogConfigRequest>,
+    req: HttpRequest,
 ) -> HttpResponse {
-    let db = state.db.get().unwrap();
+    let _admin_id = match verify_admin_token(&state, &req) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+
+    let db = match state.db.get() {
+        Ok(db) => db,
+        Err(_) => return HttpResponse::InternalServerError().json(AdminResponse {
+            success: false, data: None, error: Some("数据库连接失败".to_string()), total: None,
+        }),
+    };
 
     set_config_value(&db, "log_level", &body.log_level);
     set_config_value(&db, "log_retention_days", &body.log_retention_days);
@@ -653,18 +715,26 @@ pub async fn save_log_config(
         None, None);
 
     HttpResponse::Ok().json(AdminResponse {
-        success: true,
-        data: Some(serde_json::json!({"message": "日志配置已保存"})),
-        error: None,
-        total: None,
+        success: true, data: Some(serde_json::json!({"message": "日志配置已保存"})), error: None, total: None,
     })
 }
 
 #[post("/admin/logs/clean")]
 pub async fn clean_logs(
     state: web::Data<AppState>,
+    req: HttpRequest,
 ) -> HttpResponse {
-    let db = state.db.get().unwrap();
+    let _admin_id = match verify_admin_token(&state, &req) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+
+    let db = match state.db.get() {
+        Ok(db) => db,
+        Err(_) => return HttpResponse::InternalServerError().json(AdminResponse {
+            success: false, data: None, error: Some("数据库连接失败".to_string()), total: None,
+        }),
+    };
 
     let retention_days = get_config_value(&db, "log_retention_days")
         .unwrap_or_else(|| "7".to_string())
@@ -688,15 +758,11 @@ pub async fn clean_logs(
                     "deleted_count": count,
                     "retention_days": retention_days,
                 })),
-                error: None,
-                total: None,
+                error: None, total: None,
             })
         }
-        Err(e) => HttpResponse::Ok().json(AdminResponse {
-            success: false,
-            data: None,
-            error: Some(format!("清理失败: {}", e)),
-            total: None,
+        Err(e) => HttpResponse::InternalServerError().json(AdminResponse {
+            success: false, data: None, error: Some(format!("清理失败: {}", e)), total: None,
         }),
     }
 }
@@ -708,17 +774,33 @@ pub async fn clean_logs(
 #[get("/admin/cron")]
 pub async fn get_cron_tasks(
     state: web::Data<AppState>,
+    req: HttpRequest,
 ) -> HttpResponse {
-    let db = state.db.get().unwrap();
+    let _admin_id = match verify_admin_token(&state, &req) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
 
-    let mut stmt = db.prepare(
+    let db = match state.db.get() {
+        Ok(db) => db,
+        Err(_) => return HttpResponse::InternalServerError().json(AdminResponse {
+            success: false, data: None, error: Some("数据库连接失败".to_string()), total: None,
+        }),
+    };
+
+    let mut stmt = match db.prepare(
         "SELECT c.id, c.user_id, u.mobile, u.nickname, c.cron_expression, c.status, \
          c.last_run_at, c.last_run_status, c.last_run_message, \
          c.total_runs, c.success_runs, c.failed_runs, c.created_at \
          FROM user_cron_tasks c \
          LEFT JOIN users u ON c.user_id = u.id \
          ORDER BY c.created_at DESC"
-    ).unwrap();
+    ) {
+        Ok(s) => s,
+        Err(e) => return HttpResponse::InternalServerError().json(AdminResponse {
+            success: false, data: None, error: Some(format!("查询失败: {}", e)), total: None,
+        }),
+    };
 
     let tasks: Vec<serde_json::Value> = stmt.query_map([], |row| {
         Ok(serde_json::json!({
@@ -742,10 +824,7 @@ pub async fn get_cron_tasks(
     .collect();
 
     HttpResponse::Ok().json(AdminResponse {
-        success: true,
-        data: Some(serde_json::json!(tasks)),
-        error: None,
-        total: None,
+        success: true, data: Some(serde_json::json!(tasks)), error: None, total: None,
     })
 }
 
@@ -753,8 +832,19 @@ pub async fn get_cron_tasks(
 pub async fn create_or_update_cron(
     state: web::Data<AppState>,
     body: web::Json<CronCreateRequest>,
+    req: HttpRequest,
 ) -> HttpResponse {
-    let db = state.db.get().unwrap();
+    let _admin_id = match verify_admin_token(&state, &req) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+
+    let db = match state.db.get() {
+        Ok(db) => db,
+        Err(_) => return HttpResponse::InternalServerError().json(AdminResponse {
+            success: false, data: None, error: Some("数据库连接失败".to_string()), total: None,
+        }),
+    };
 
     // 验证用户存在
     let user_exists: bool = db.query_row(
@@ -764,11 +854,8 @@ pub async fn create_or_update_cron(
     ).unwrap_or(0) > 0;
 
     if !user_exists {
-        return HttpResponse::Ok().json(AdminResponse {
-            success: false,
-            data: None,
-            error: Some("用户不存在".to_string()),
-            total: None,
+        return HttpResponse::NotFound().json(AdminResponse {
+            success: false, data: None, error: Some("用户不存在".to_string()), total: None,
         });
     }
 
@@ -795,17 +882,11 @@ pub async fn create_or_update_cron(
                 &format!("管理员设置了用户 #{} 的定时任务: {}", body.user_id, body.cron_expression),
                 None, None, None);
             HttpResponse::Ok().json(AdminResponse {
-                success: true,
-                data: Some(serde_json::json!({"message": "定时任务已保存"})),
-                error: None,
-                total: None,
+                success: true, data: Some(serde_json::json!({"message": "定时任务已保存"})), error: None, total: None,
             })
         }
-        Err(e) => HttpResponse::Ok().json(AdminResponse {
-            success: false,
-            data: None,
-            error: Some(format!("保存失败: {}", e)),
-            total: None,
+        Err(e) => HttpResponse::InternalServerError().json(AdminResponse {
+            success: false, data: None, error: Some(format!("保存失败: {}", e)), total: None,
         }),
     }
 }
@@ -814,8 +895,19 @@ pub async fn create_or_update_cron(
 pub async fn toggle_cron(
     state: web::Data<AppState>,
     body: web::Json<CronToggleRequest>,
+    req: HttpRequest,
 ) -> HttpResponse {
-    let db = state.db.get().unwrap();
+    let _admin_id = match verify_admin_token(&state, &req) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+
+    let db = match state.db.get() {
+        Ok(db) => db,
+        Err(_) => return HttpResponse::InternalServerError().json(AdminResponse {
+            success: false, data: None, error: Some("数据库连接失败".to_string()), total: None,
+        }),
+    };
 
     // 获取当前状态
     let current: String = db.query_row(
@@ -843,23 +935,16 @@ pub async fn toggle_cron(
                         "message": if new_status == "active" { "已启用" } else { "已禁用" },
                         "new_status": new_status,
                     })),
-                    error: None,
-                    total: None,
+                    error: None, total: None,
                 })
             } else {
-                HttpResponse::Ok().json(AdminResponse {
-                    success: false,
-                    data: None,
-                    error: Some("定时任务不存在".to_string()),
-                    total: None,
+                HttpResponse::NotFound().json(AdminResponse {
+                    success: false, data: None, error: Some("定时任务不存在".to_string()), total: None,
                 })
             }
         }
-        Err(e) => HttpResponse::Ok().json(AdminResponse {
-            success: false,
-            data: None,
-            error: Some(format!("操作失败: {}", e)),
-            total: None,
+        Err(e) => HttpResponse::InternalServerError().json(AdminResponse {
+            success: false, data: None, error: Some(format!("操作失败: {}", e)), total: None,
         }),
     }
 }
@@ -868,8 +953,19 @@ pub async fn toggle_cron(
 pub async fn delete_cron(
     state: web::Data<AppState>,
     body: web::Json<CronDeleteRequest>,
+    req: HttpRequest,
 ) -> HttpResponse {
-    let db = state.db.get().unwrap();
+    let _admin_id = match verify_admin_token(&state, &req) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+
+    let db = match state.db.get() {
+        Ok(db) => db,
+        Err(_) => return HttpResponse::InternalServerError().json(AdminResponse {
+            success: false, data: None, error: Some("数据库连接失败".to_string()), total: None,
+        }),
+    };
 
     let result = db.execute(
         "DELETE FROM user_cron_tasks WHERE id = ?1",
@@ -883,25 +979,16 @@ pub async fn delete_cron(
                     &format!("管理员删除了定时任务 #{}", body.id),
                     None, None, None);
                 HttpResponse::Ok().json(AdminResponse {
-                    success: true,
-                    data: Some(serde_json::json!({"message": "已删除"})),
-                    error: None,
-                    total: None,
+                    success: true, data: Some(serde_json::json!({"message": "已删除"})), error: None, total: None,
                 })
             } else {
-                HttpResponse::Ok().json(AdminResponse {
-                    success: false,
-                    data: None,
-                    error: Some("定时任务不存在".to_string()),
-                    total: None,
+                HttpResponse::NotFound().json(AdminResponse {
+                    success: false, data: None, error: Some("定时任务不存在".to_string()), total: None,
                 })
             }
         }
-        Err(e) => HttpResponse::Ok().json(AdminResponse {
-            success: false,
-            data: None,
-            error: Some(format!("删除失败: {}", e)),
-            total: None,
+        Err(e) => HttpResponse::InternalServerError().json(AdminResponse {
+            success: false, data: None, error: Some(format!("删除失败: {}", e)), total: None,
         }),
     }
 }
@@ -913,8 +1000,19 @@ pub async fn delete_cron(
 #[get("/admin/system")]
 pub async fn get_system_config(
     state: web::Data<AppState>,
+    req: HttpRequest,
 ) -> HttpResponse {
-    let db = state.db.get().unwrap();
+    let _admin_id = match verify_admin_token(&state, &req) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+
+    let db = match state.db.get() {
+        Ok(db) => db,
+        Err(_) => return HttpResponse::InternalServerError().json(AdminResponse {
+            success: false, data: None, error: Some("数据库连接失败".to_string()), total: None,
+        }),
+    };
 
     let guest_register_enabled: i32 = get_config_value(&db, "guest_register_enabled")
         .unwrap_or_else(|| "0".to_string())
@@ -930,8 +1028,7 @@ pub async fn get_system_config(
             "log_level": log_level,
             "log_retention_days": log_retention_days,
         })),
-        error: None,
-        total: None,
+        error: None, total: None,
     })
 }
 
@@ -939,48 +1036,50 @@ pub async fn get_system_config(
 pub async fn change_admin_password(
     state: web::Data<AppState>,
     body: web::Json<ChangePasswordRequest>,
+    req: HttpRequest,
 ) -> HttpResponse {
-    let db = state.db.get().unwrap();
+    let admin_id = match verify_admin_token(&state, &req) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
 
-    // 获取当前管理员密码 (默认 admin)
+    let db = match state.db.get() {
+        Ok(db) => db,
+        Err(_) => return HttpResponse::InternalServerError().json(AdminResponse {
+            success: false, data: None, error: Some("数据库连接失败".to_string()), total: None,
+        }),
+    };
+
+    // 获取当前管理员密码（使用 session 中的 admin_id，不再硬编码 id=1）
     let stored_password: String = db.query_row(
-        "SELECT password FROM admins WHERE id = 1",
-        [],
+        "SELECT password FROM admins WHERE id = ?1",
+        rusqlite::params![admin_id],
         |row| row.get(0),
     ).unwrap_or_default();
 
     if !verify(&body.old_password, &stored_password).unwrap_or(false) {
-        return HttpResponse::Ok().json(AdminResponse {
-            success: false,
-            data: None,
-            error: Some("原密码错误".to_string()),
-            total: None,
+        return HttpResponse::BadRequest().json(AdminResponse {
+            success: false, data: None, error: Some("原密码错误".to_string()), total: None,
         });
     }
 
     let hashed = hash(&body.new_password, DEFAULT_COST).unwrap();
     let result = db.execute(
-        "UPDATE admins SET password = ?1 WHERE id = 1",
-        rusqlite::params![hashed],
+        "UPDATE admins SET password = ?1 WHERE id = ?2",
+        rusqlite::params![hashed, admin_id],
     );
 
     match result {
         Ok(_) => {
             log_to_db(&db, "auth", "warn",
                 "管理员修改了密码",
-                None, None, None);
+                None, Some(admin_id), None);
             HttpResponse::Ok().json(AdminResponse {
-                success: true,
-                data: Some(serde_json::json!({"message": "密码已修改"})),
-                error: None,
-                total: None,
+                success: true, data: Some(serde_json::json!({"message": "密码已修改"})), error: None, total: None,
             })
         }
-        Err(e) => HttpResponse::Ok().json(AdminResponse {
-            success: false,
-            data: None,
-            error: Some(format!("修改失败: {}", e)),
-            total: None,
+        Err(e) => HttpResponse::InternalServerError().json(AdminResponse {
+            success: false, data: None, error: Some(format!("修改失败: {}", e)), total: None,
         }),
     }
 }
@@ -989,47 +1088,49 @@ pub async fn change_admin_password(
 pub async fn update_admin_username(
     state: web::Data<AppState>,
     body: web::Json<ChangeUsernameRequest>,
+    req: HttpRequest,
 ) -> HttpResponse {
-    let db = state.db.get().unwrap();
+    let admin_id = match verify_admin_token(&state, &req) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+
+    let db = match state.db.get() {
+        Ok(db) => db,
+        Err(_) => return HttpResponse::InternalServerError().json(AdminResponse {
+            success: false, data: None, error: Some("数据库连接失败".to_string()), total: None,
+        }),
+    };
 
     // 检查新用户名是否已存在
     let exists: bool = db.query_row(
-        "SELECT COUNT(*) FROM admins WHERE username = ?1",
-        rusqlite::params![body.new_username],
+        "SELECT COUNT(*) FROM admins WHERE username = ?1 AND id != ?2",
+        rusqlite::params![body.new_username, admin_id],
         |row| row.get::<_, i64>(0),
     ).unwrap_or(0) > 0;
 
     if exists {
-        return HttpResponse::Ok().json(AdminResponse {
-            success: false,
-            data: None,
-            error: Some("用户名已存在".to_string()),
-            total: None,
+        return HttpResponse::Conflict().json(AdminResponse {
+            success: false, data: None, error: Some("用户名已存在".to_string()), total: None,
         });
     }
 
     let result = db.execute(
-        "UPDATE admins SET username = ?1 WHERE id = 1",
-        rusqlite::params![body.new_username],
+        "UPDATE admins SET username = ?1 WHERE id = ?2",
+        rusqlite::params![body.new_username, admin_id],
     );
 
     match result {
         Ok(_) => {
             log_to_db(&db, "auth", "warn",
                 "管理员修改了用户名",
-                None, None, None);
+                None, Some(admin_id), None);
             HttpResponse::Ok().json(AdminResponse {
-                success: true,
-                data: Some(serde_json::json!({"message": "用户名已修改"})),
-                error: None,
-                total: None,
+                success: true, data: Some(serde_json::json!({"message": "用户名已修改"})), error: None, total: None,
             })
         }
-        Err(e) => HttpResponse::Ok().json(AdminResponse {
-            success: false,
-            data: None,
-            error: Some(format!("修改失败: {}", e)),
-            total: None,
+        Err(e) => HttpResponse::InternalServerError().json(AdminResponse {
+            success: false, data: None, error: Some(format!("修改失败: {}", e)), total: None,
         }),
     }
 }
@@ -1038,8 +1139,19 @@ pub async fn update_admin_username(
 pub async fn toggle_guest_register(
     state: web::Data<AppState>,
     body: web::Json<GuestRegisterRequest>,
+    req: HttpRequest,
 ) -> HttpResponse {
-    let db = state.db.get().unwrap();
+    let _admin_id = match verify_admin_token(&state, &req) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+
+    let db = match state.db.get() {
+        Ok(db) => db,
+        Err(_) => return HttpResponse::InternalServerError().json(AdminResponse {
+            success: false, data: None, error: Some("数据库连接失败".to_string()), total: None,
+        }),
+    };
 
     set_config_value(&db, "guest_register_enabled", &body.enabled);
 
@@ -1055,8 +1167,7 @@ pub async fn toggle_guest_register(
             "message": format!("游客注册已{}", if enabled_num == 1 { "启用" } else { "禁用" }),
             "guest_register_enabled": enabled_num,
         })),
-        error: None,
-        total: None,
+        error: None, total: None,
     })
 }
 

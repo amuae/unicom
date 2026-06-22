@@ -4,6 +4,9 @@ use actix_web::{web, App, HttpServer, middleware, HttpRequest, HttpResponse};
 use tracing_subscriber::EnvFilter;
 use std::sync::Arc;
 use std::io::{self, Write, IsTerminal};
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::Instant;
 
 mod config;
 mod db;
@@ -21,7 +24,52 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub struct AppState {
     pub db: db::DbPool,
     pub config: config::Config,
-    pub static_files: Arc<std::collections::HashMap<String, StaticFile>>,
+    pub static_files: Arc<HashMap<String, StaticFile>>,
+    pub rate_limiter: Arc<Mutex<RateLimiter>>,
+    pub session_cache: Arc<Mutex<handlers::auth::SessionCache>>,
+}
+
+/// 简单的内存速率限制器（IP → 最近请求记录）
+pub struct RateLimiter {
+    /// IP → (请求次数, 窗口开始时间)
+    attempts: HashMap<String, (u32, Instant)>,
+    /// 最大请求数（每个窗口）
+    max_requests: u32,
+    /// 窗口时长（秒）
+    window_secs: u64,
+}
+
+impl RateLimiter {
+    fn new(max_requests: u32, window_secs: u64) -> Self {
+        Self {
+            attempts: HashMap::new(),
+            max_requests,
+            window_secs,
+        }
+    }
+
+    /// 检查是否超过速率限制，返回 true 表示允许，false 表示拒绝
+    fn check(&mut self, key: &str) -> bool {
+        let now = Instant::now();
+        let entry = self.attempts.entry(key.to_string()).or_insert((0, now));
+
+        // 窗口过期，重置
+        if now.duration_since(entry.1).as_secs() >= self.window_secs {
+            *entry = (1, now);
+            return true;
+        }
+
+        entry.0 += 1;
+        entry.0 <= self.max_requests
+    }
+
+    /// 清理过期条目
+    pub fn cleanup(&mut self) {
+        let now = Instant::now();
+        self.attempts.retain(|_, (_, start)| {
+            now.duration_since(*start).as_secs() < self.window_secs * 2
+        });
+    }
 }
 
 // ═══════════════════════════════════════════════
@@ -40,7 +88,6 @@ fn get_pid() -> Option<u32> {
         if let Ok(pid) = content.trim().parse::<u32>() {
             #[cfg(target_os = "windows")]
             {
-                // Windows: check if process exists via tasklist
                 let output = std::process::Command::new("tasklist")
                     .args(["/FI", &format!("PID eq {}", pid), "/NH"])
                     .stdout(std::process::Stdio::piped())
@@ -48,7 +95,6 @@ fn get_pid() -> Option<u32> {
                     .output();
                 if let Ok(out) = output {
                     let stdout = String::from_utf8_lossy(&out.stdout);
-                    // tasklist returns "INFO: no tasks running" if not found
                     if stdout.contains(&pid.to_string()) {
                         return Some(pid);
                     }
@@ -120,11 +166,9 @@ fn cmd_status() {
             
             #[cfg(not(target_os = "windows"))]
             {
-            // 读取 /proc/[pid]/status 获取资源信息
             let status_path = format!("/proc/{}/status", pid);
             let stat_path = format!("/proc/{}/stat", pid);
             
-            // 内存信息
             if let Ok(content) = std::fs::read_to_string(&status_path) {
                 for line in content.lines() {
                     if line.starts_with("VmRSS:") {
@@ -141,7 +185,6 @@ fn cmd_status() {
                 }
             }
             
-            // CPU 占用率（采样 500ms）
             if let (Ok(content1), Ok(sys1)) = (
                 std::fs::read_to_string(&stat_path),
                 std::fs::read_to_string("/proc/stat"),
@@ -184,20 +227,18 @@ fn cmd_status() {
                 }
             }
             
-            // 运行时间
             if let Ok(content) = std::fs::read_to_string(&stat_path) {
                 let fields: Vec<&str> = content.split_whitespace().collect();
                 if fields.len() > 21 {
                     let starttime: u64 = fields[21].parse().unwrap_or(0);
-                    let uptime_path = "/proc/uptime";
-                    if let Ok(uptime_content) = std::fs::read_to_string(uptime_path) {
+                    if let Ok(uptime_content) = std::fs::read_to_string("/proc/uptime") {
                         let uptime_secs: f64 = uptime_content
                             .split_whitespace()
                             .next()
                             .unwrap_or("0")
                             .parse()
                             .unwrap_or(0.0);
-                        let hz = 100.0; // 假设 100 Hz
+                        let hz = 100.0;
                         let start_secs = starttime as f64 / hz;
                         let run_secs = uptime_secs - start_secs;
                         if run_secs > 0.0 {
@@ -226,7 +267,6 @@ fn cmd_start() {
         println!("服务已在运行中 (PID: {})", get_pid().unwrap());
         return;
     }
-    // Android: 使用 service.d 脚本
     let android_script = "/data/adb/service.d/unicom.sh";
     if std::path::Path::new(android_script).exists() {
         println!("启动服务...");
@@ -248,16 +288,14 @@ fn cmd_start() {
     #[cfg(target_os = "windows")]
     {
         let exe = format!("{}/unicom.exe", install_dir);
-        // Windows: use CREATE_NO_WINDOW to detach from console
         use std::os::windows::process::CommandExt;
         let result = std::process::Command::new(&exe)
             .current_dir(&install_dir)
-            .creation_flags(0x08000000) // CREATE_NO_WINDOW
-            .stdin(std::process::Stdio::null())  // 关键：让 is_terminal() 返回 false，跳过交互菜单
+            .creation_flags(0x08000000)
+            .stdin(std::process::Stdio::null())
             .spawn();
         match result {
             Ok(child) => {
-                // Write PID manually since we can't rely on kill -0 check
                 std::fs::write(format!("{}/unicom.pid", install_dir), child.id().to_string()).ok();
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 if is_running() {
@@ -289,7 +327,6 @@ fn cmd_start() {
 }
 
 fn cmd_stop() {
-    // Android: 优先使用 service.d 脚本
     let android_script = "/data/adb/service.d/unicom.sh";
     if std::path::Path::new(android_script).exists() {
         println!("停止服务...");
@@ -313,7 +350,6 @@ fn cmd_stop() {
             println!("停止服务 (PID: {})...", pid);
             #[cfg(target_os = "windows")]
             {
-                // Windows: use taskkill
                 std::process::Command::new("taskkill")
                     .args(["/PID", &pid.to_string(), "/F"])
                     .stdout(std::process::Stdio::null())
@@ -323,13 +359,11 @@ fn cmd_stop() {
             }
             #[cfg(not(target_os = "windows"))]
             {
-                // 先尝试 SIGTERM
                 std::process::Command::new("kill")
                     .arg(pid.to_string())
                     .status()
                     .ok();
                 std::thread::sleep(std::time::Duration::from_secs(2));
-                // 如果还在运行，用 SIGKILL
                 if is_running() {
                     println!("SIGTERM 无效，尝试 SIGKILL...");
                     std::process::Command::new("kill")
@@ -362,37 +396,31 @@ fn cmd_reset_pass() {
     let conn = rusqlite::Connection::open(&config.database_path).expect("Failed to open database");
     conn.execute_batch("PRAGMA foreign_keys = ON;").ok();
 
-    // 生成随机用户名和密码
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64;
+    use rand::Rng;
+    let mut rng = rand::rngs::OsRng;
     let chars: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    // 用种子混合索引，确保每个字符都不同
-    let mix = |val: u64| -> char {
-        let h = val.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        chars[(h >> 33) as usize % chars.len()] as char
-    };
-    let username: String = (0..6).map(|i| mix(seed.wrapping_add(i as u64 * 7 + 1))).collect();
-    let password: String = (0..16).map(|i| mix(seed.wrapping_add(i as u64 * 13 + 31))).collect();
+    let username: String = (0..8).map(|_| {
+        let idx = rng.gen_range(0..chars.len());
+        chars[idx] as char
+    }).collect();
+    let password: String = (0..16).map(|_| {
+        let idx = rng.gen_range(0..chars.len());
+        chars[idx] as char
+    }).collect();
     let username = format!("admin_{}", username);
 
     let hashed = bcrypt::hash(&password, bcrypt::DEFAULT_COST).unwrap();
 
-    // 检查是否有管理员
     let admin_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM admins", [], |row| row.get(0))
         .unwrap_or(0);
 
     let result = if admin_count > 0 {
-        // 更新已有管理员
         conn.execute(
             "UPDATE admins SET username = ?1, password = ?2 WHERE id = (SELECT id FROM admins LIMIT 1)",
             rusqlite::params![username, hashed],
         )
     } else {
-        // 创建新管理员
         conn.execute(
             "INSERT INTO admins (username, password) VALUES (?1, ?2)",
             rusqlite::params![username, hashed],
@@ -528,14 +556,10 @@ fn do_uninstall() {
     io::stdout().flush().unwrap();
 
     if read_line() == "yes" {
-        // 停止服务
         cmd_stop();
-
-        // 删除文件
         println!("删除文件...");
         std::fs::remove_dir_all(&install_dir).ok();
 
-        // 删除服务脚本
         let service_script = "/data/adb/service.d/unicom.sh";
         if std::path::Path::new(service_script).exists() {
             std::fs::remove_file(service_script).ok();
@@ -586,13 +610,11 @@ fn interactive_menu() {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    // 切换工作目录到二进制所在目录，确保相对路径（config.toml、unicom.db、unicom.pid）正确
     let install_dir = get_install_dir();
     std::env::set_current_dir(&install_dir).ok();
 
     let args: Vec<String> = std::env::args().collect();
 
-    // 有参数：快捷指令模式
     if args.len() > 1 {
         match args[1].as_str() {
             "start" => {
@@ -615,20 +637,11 @@ async fn main() -> std::io::Result<()> {
         return Ok(());
     }
 
-    // 无参数：检测是否有终端
-    // 有终端 → 交互菜单，无终端（systemctl） → 直接启动服务
     let has_tty = io::stdin().is_terminal();
     
     if has_tty {
-        // 有终端：交互菜单模式
         interactive_menu();
     }
-
-    // 直接启动服务（systemctl 或从菜单中选择启动）
-
-    // ═══════════════════════════════════════════════
-    // 以下为正常服务启动（从 menu 1 或直接 ./unicom 会到这里）
-    // ═══════════════════════════════════════════════
 
     // 加载配置
     let config = config::Config::load().expect("Failed to load config");
@@ -645,23 +658,59 @@ async fn main() -> std::io::Result<()> {
     // 初始化数据库连接池
     let db = db::create_pool(&config.database_path);
     db::init_schema(&db);
-    tracing::info!("Database pool initialized (max_size=10, WAL mode)");
+    tracing::info!("Database pool initialized (max_size=10, WAL mode, busy_timeout=5s)");
 
     // 加载静态文件
     let static_files = Arc::new(static_files::load_static_files());
     tracing::info!("Loaded {} static files", static_files.len());
+
+    // 创建速率限制器（10 次/分钟）
+    let rate_limiter = Arc::new(Mutex::new(RateLimiter::new(10, 60)));
+
+    // 创建 session 缓存（30 秒 TTL，避免每次 admin 请求都查 DB）
+    let session_cache = Arc::new(Mutex::new(handlers::auth::SessionCache::new(30)));
 
     // 创建应用状态
     let app_state = AppState {
         db: db.clone(),
         config: config.clone(),
         static_files: static_files.clone(),
+        rate_limiter: rate_limiter.clone(),
+        session_cache: session_cache.clone(),
     };
 
     // 启动定时任务
     let cron_state = app_state.clone();
     tokio::spawn(async move {
         cron::start_cron_jobs(cron_state).await;
+    });
+
+    // 启动定期清理任务（每 5 分钟清理过期 session + rate limiter）
+    let cleanup_rl = rate_limiter.clone();
+    let cleanup_sc = session_cache.clone();
+    let cleanup_db = db.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+        loop {
+            interval.tick().await;
+            // 清理 rate limiter
+            {
+                let mut rl = cleanup_rl.lock().unwrap();
+                rl.cleanup();
+            }
+            // 清理 session 缓存
+            {
+                let mut sc = cleanup_sc.lock().unwrap();
+                sc.cleanup();
+            }
+            // 清理 DB 中的过期 session
+            if let Ok(conn) = cleanup_db.get() {
+                let _ = conn.execute(
+                    "DELETE FROM admin_sessions WHERE expires_at < datetime('now')",
+                    [],
+                );
+            }
+        }
     });
 
     // 写入 PID 文件
@@ -672,12 +721,27 @@ async fn main() -> std::io::Result<()> {
     println!("Unicom v{} 启动成功 http://{}:{}", VERSION, config.host, config.port);
 
     // 启动 HTTP 服务器
+    let allowed_origins = config.notify.allowed_origins.clone();
     HttpServer::new(move || {
-        let cors = Cors::default()
-            .allow_any_origin()
-            .allow_any_method()
-            .allow_any_header()
-            .max_age(3600);
+        let cors = if allowed_origins.is_empty() {
+            Cors::default()
+                .allowed_origin("http://localhost")
+                .allowed_origin("http://127.0.0.1")
+                .allowed_origin("http://localhost:8080")
+                .allowed_origin("http://127.0.0.1:8080")
+                .allowed_methods(vec!["GET", "POST", "PUT", "DELETE", "OPTIONS"])
+                .allowed_headers(vec!["Content-Type", "Authorization"])
+                .max_age(3600)
+        } else {
+            let mut cors_builder = Cors::default();
+            for origin in &allowed_origins {
+                cors_builder = cors_builder.allowed_origin(origin);
+            }
+            cors_builder
+                .allowed_methods(vec!["GET", "POST", "PUT", "DELETE", "OPTIONS"])
+                .allowed_headers(vec!["Content-Type", "Authorization"])
+                .max_age(3600)
+        };
 
         App::new()
             .app_data(web::Data::new(app_state.clone()))
@@ -759,7 +823,6 @@ async fn serve_static(req: HttpRequest, state: web::Data<AppState>) -> HttpRespo
             .content_type(file.content_type)
             .body(file.content)
     } else {
-        // SPA fallback
         if let Some(file) = state.static_files.get("index.html") {
             HttpResponse::Ok()
                 .content_type(file.content_type)

@@ -1,9 +1,9 @@
-use actix_web::{get, web, HttpResponse};
+use actix_web::{get, web, HttpRequest, HttpResponse};
 use serde::Serialize;
 use chrono::{Datelike, Local};
 
 use crate::AppState;
-use crate::models::user::User;
+use crate::models::user::{User, USER_COLUMNS};
 use crate::services::query::query_user_flow;
 use crate::services::flow_analysis;
 use crate::services::notify;
@@ -18,44 +18,22 @@ pub struct QueryResponse {
 /// 从 DB 按 token 查询活跃用户
 pub fn query_user_by_token(db: &rusqlite::Connection, token: &str) -> Result<User, rusqlite::Error> {
     db.query_row(
-        "SELECT id, mobile, nickname, query_password, auth_type, appid, token_online, cookie, cookie_created_at, \
-         status, last_query_at, created_at, updated_at, \
-         COALESCE(today_query_data, ''), COALESCE(last_query_data, ''), last_query_time, \
-         token, notify_enabled, notify_type, notify_params, notify_title, notify_subtitle, notify_content, \
-         notify_threshold, query_interval, last_notify_time \
-         FROM users WHERE token = ?1 AND status = 'active'",
+        &format!("SELECT {} FROM users WHERE token = ?1 AND status = 'active'", USER_COLUMNS),
         [token],
-        |row| {
-            Ok(User {
-                id: row.get(0)?,
-                mobile: row.get(1)?,
-                nickname: row.get(2)?,
-                query_password: row.get(3)?,
-                auth_type: row.get(4)?,
-                appid: row.get(5)?,
-                token_online: row.get(6)?,
-                cookie: row.get(7)?,
-                cookie_created_at: row.get(8)?,
-                status: row.get(9)?,
-                last_query_at: row.get(10)?,
-                created_at: row.get(11)?,
-                updated_at: row.get(12)?,
-                today_query_data: row.get(13)?,
-                last_query_data: row.get(14)?,
-                last_query_time: row.get(15)?,
-                token: row.get(16)?,
-                notify_enabled: row.get(17)?,
-                notify_type: row.get(18)?,
-                notify_params: row.get(19)?,
-                notify_title: row.get(20)?,
-                notify_subtitle: row.get(21)?,
-                notify_content: row.get(22)?,
-                notify_threshold: row.get(23)?,
-                query_interval: row.get(24)?,
-                last_notify_time: row.get(25)?,
-            })
-        },
+        |row| User::from_row(row),
     )
+}
+
+/// 从请求中提取用户 token（优先从 Authorization header，回退到 URL path）
+pub fn extract_user_token(req: &HttpRequest, path_token: Option<&str>) -> Option<String> {
+    // 优先从 header 读取
+    if let Some(auth) = req.headers().get("Authorization").and_then(|v| v.to_str().ok()) {
+        if auth.starts_with("Bearer ") {
+            return Some(auth[7..].to_string());
+        }
+    }
+    // 回退到 URL path token
+    path_token.map(|s| s.to_string())
 }
 
 /// 执行查询并分析流量数据（核心逻辑，供多个 handler 复用）
@@ -65,7 +43,7 @@ pub async fn perform_query_analysis(
 ) -> Result<serde_json::Value, String> {
     // ── Phase 1: 获取用户 ──
     let user = {
-        let db = state.db.get().unwrap();
+        let db = state.db.get().map_err(|e| format!("数据库连接失败: {}", e))?;
         query_user_by_token(&db, token)
             .map_err(|_| "用户不存在或已被禁用".to_string())?
     };
@@ -76,7 +54,7 @@ pub async fn perform_query_analysis(
 
     // ── Phase 3: 更新 cookie ──
     {
-        let db = state.db.get().unwrap();
+        let db = state.db.get().map_err(|e| format!("数据库连接失败: {}", e))?;
         if result.need_update_cookie {
             db.execute(
                 "UPDATE users SET cookie = ?1, cookie_created_at = ?2, \
@@ -154,7 +132,7 @@ pub async fn perform_query_analysis(
     let now_str = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
     {
-        let db = state.db.get().unwrap();
+        let db = state.db.get().map_err(|e| format!("数据库连接失败: {}", e))?;
 
         // 检查是否跨月
         let is_cross_month = if let Some(last_time) = user.last_query_time {
@@ -167,7 +145,6 @@ pub async fn perform_query_analysis(
         };
 
         // 是否需要更新 last_query_data（基线数据）
-        // 条件：首次 / 跨月 / 达到阈值
         let update_last = user.last_query_data.is_empty() || is_cross_month || should_notify;
 
         if update_last {
@@ -190,7 +167,7 @@ pub async fn perform_query_analysis(
 }
 
 // ─────────────────────────────────────────────
-// API 端点
+// API 端点（旧版 URL token，保留兼容）
 // ─────────────────────────────────────────────
 
 #[get("/query/flow/{token}")]
@@ -206,11 +183,18 @@ pub async fn query_flow(
             data: Some(data),
             error: None,
         }),
-        Err(e) => HttpResponse::InternalServerError().json(QueryResponse {
-            success: false,
-            data: None,
-            error: Some(e),
-        }),
+        Err(e) => {
+            let mut status = if e.contains("用户不存在") {
+                HttpResponse::NotFound()
+            } else {
+                HttpResponse::InternalServerError()
+            };
+            status.json(QueryResponse {
+                success: false,
+                data: None,
+                error: Some(e),
+            })
+        }
     }
 }
 
@@ -221,7 +205,14 @@ pub async fn query_balance(
 ) -> HttpResponse {
     let token = path.into_inner();
     let user = {
-        let db = state.db.get().unwrap();
+        let db = match state.db.get() {
+            Ok(db) => db,
+            Err(e) => return HttpResponse::InternalServerError().json(QueryResponse {
+                success: false,
+                data: None,
+                error: Some(format!("数据库连接失败: {}", e)),
+            }),
+        };
         query_user_by_token(&db, &token)
     };
 
@@ -236,7 +227,14 @@ pub async fn query_balance(
         }
     };
 
-    let unicom_service = crate::services::unicom::UnicomService::new(state.config.unicom.clone()).unwrap();
+    let unicom_service = match crate::services::unicom::UnicomService::new(state.config.unicom.clone()) {
+        Ok(s) => s,
+        Err(e) => return HttpResponse::InternalServerError().json(QueryResponse {
+            success: false,
+            data: None,
+            error: Some(format!("创建 HTTP 客户端失败: {}", e)),
+        }),
+    };
 
     match unicom_service.query_balance(&user.cookie).await {
         Ok(balance) => HttpResponse::Ok().json(QueryResponse {

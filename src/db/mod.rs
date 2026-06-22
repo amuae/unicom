@@ -21,6 +21,7 @@ impl r2d2::CustomizeConnection<Connection, rusqlite::Error> for ConnectionCustom
     fn on_acquire(&self, conn: &mut Connection) -> Result<(), rusqlite::Error> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         conn.execute_batch("PRAGMA journal_mode = WAL;")?;
+        conn.execute_batch("PRAGMA busy_timeout = 5000;")?;
         Ok(())
     }
 }

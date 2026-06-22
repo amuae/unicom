@@ -3,7 +3,7 @@ use tracing::{info, error, warn, debug};
 use chrono::{Datelike, Local, Timelike};
 
 use crate::AppState;
-use crate::models::user::User;
+use crate::models::user::{User, USER_COLUMNS};
 use crate::services::query::query_user_flow;
 use crate::services::flow_analysis::{self, FlowDiff};
 use crate::services::notify;
@@ -35,7 +35,7 @@ pub async fn start_cron_jobs(state: AppState) {
 async fn check_and_run_cron_tasks(state: AppState) -> anyhow::Result<()> {
     // 查询所有 active 的定时任务
     let tasks: Vec<(i64, i64, String, String)> = {
-        let db = state.db.get().unwrap();
+        let db = state.db.get().map_err(|e| anyhow::anyhow!("获取数据库连接失败: {}", e))?;
         let mut stmt = db.prepare(
             "SELECT c.id, c.user_id, c.mobile, c.cron_expression \
              FROM user_cron_tasks c \
@@ -43,18 +43,17 @@ async fn check_and_run_cron_tasks(state: AppState) -> anyhow::Result<()> {
              WHERE c.status = 'active' AND u.status = 'active'"
         )?;
 
-        let tasks = stmt.query_map([], |row| {
-            Ok((
+        let mut result = Vec::new();
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            result.push((
                 row.get::<_, i64>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
-            ))
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
-        
-        tasks
+            ));
+        }
+        result
     };
 
     debug!("定时任务检查: 找到 {} 个活跃任务，开始并发执行", tasks.len());
@@ -76,7 +75,13 @@ async fn check_and_run_cron_tasks(state: AppState) -> anyhow::Result<()> {
         handles.push(tokio::spawn(async move {
             // 获取完整用户信息
             let user = {
-                let db = state_clone.db.get().unwrap();
+                let db = match state_clone.db.get() {
+                    Ok(db) => db,
+                    Err(e) => {
+                        warn!("定时任务 #{}: 获取数据库连接失败: {}", task_id, e);
+                        return;
+                    }
+                };
                 get_user_by_id(&db, user_id)
             };
 
@@ -98,7 +103,13 @@ async fn check_and_run_cron_tasks(state: AppState) -> anyhow::Result<()> {
             };
 
             {
-                let db = state_clone.db.get().unwrap();
+                let db = match state_clone.db.get() {
+                    Ok(db) => db,
+                    Err(e) => {
+                        error!("定时任务 #{}: 获取数据库连接失败: {}", task_id, e);
+                        return;
+                    }
+                };
                 let _ = db.execute(
                     "UPDATE user_cron_tasks SET \
                      last_run_at = ?1, last_run_status = ?2, last_run_message = ?3, \
@@ -125,46 +136,49 @@ async fn check_and_run_cron_tasks(state: AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 简单的 cron 表达式匹配（6位：秒 分 时 日 月 周）
+/// 完整的 cron 表达式匹配（支持 5 位和 6 位格式）
+///
+/// 6 位：秒 分 时 日 月 周
+/// 5 位：分 时 日 月 周
+///
+/// 支持：* / */N 具体值 逗号分隔 范围(N-M)
 fn should_run_now(cron_expr: &str, now: &chrono::DateTime<Local>) -> bool {
     let parts: Vec<&str> = cron_expr.split_whitespace().collect();
     if parts.len() < 5 {
         return false;
     }
 
-    // tokio-cron-scheduler 使用 6 位格式
-    // parts[0] = seconds, parts[1] = minutes, parts[2] = hours, ...
-    let (sec_idx, min_idx, hour_idx) = if parts.len() >= 6 {
-        (0, 1, 2)
-    } else {
-        // 5位格式：分 时 日 月 周
-        (99, 0, 1) // 99 = skip seconds check
-    };
-
     let sec = now.second() as i32;
     let min = now.minute() as i32;
     let hour = now.hour() as i32;
+    let day = now.day() as i32;
+    let month = now.month() as i32;
+    let weekday = now.weekday().num_days_from_sunday() as i32; // 0=Sun
 
-    // 检查分钟
-    if !cron_matches(parts[min_idx], min, 0, 59) {
-        return false;
-    }
-    // 检查小时
-    if !cron_matches(parts[hour_idx], hour, 0, 23) {
-        return false;
-    }
-    // 如果有秒字段，检查秒
-    if sec_idx < parts.len() {
-        if !cron_matches(parts[sec_idx], sec, 0, 59) {
-            return false;
-        }
+    if parts.len() >= 6 {
+        // 6 位：秒 分 时 日 月 周
+        if !cron_field_matches(parts[0], sec, 0, 59) { return false; }
+        if !cron_field_matches(parts[1], min, 0, 59) { return false; }
+        if !cron_field_matches(parts[2], hour, 0, 23) { return false; }
+        if !cron_field_matches(parts[3], day, 1, 31) { return false; }
+        if !cron_field_matches(parts[4], month, 1, 12) { return false; }
+        if !cron_field_matches(parts[5], weekday, 0, 7) { return false; }
+    } else {
+        // 5 位：分 时 日 月 周
+        if !cron_field_matches(parts[0], min, 0, 59) { return false; }
+        if !cron_field_matches(parts[1], hour, 0, 23) { return false; }
+        if !cron_field_matches(parts[2], day, 1, 31) { return false; }
+        if !cron_field_matches(parts[3], month, 1, 12) { return false; }
+        if !cron_field_matches(parts[4], weekday, 0, 7) { return false; }
     }
 
     true
 }
 
 /// 匹配单个 cron 字段
-fn cron_matches(field: &str, value: i32, min: i32, max: i32) -> bool {
+///
+/// 支持：* / */N / N / N-M / N,M,O
+fn cron_field_matches(field: &str, value: i32, min: i32, _max: i32) -> bool {
     if field == "*" {
         return true;
     }
@@ -177,14 +191,22 @@ fn cron_matches(field: &str, value: i32, min: i32, max: i32) -> bool {
         return false;
     }
 
-    // 处理具体数值
-    if let Ok(n) = field.parse::<i32>() {
-        return n >= min && n <= max && value == n;
-    }
-
-    // 处理逗号分隔的多个值
+    // 处理逗号分隔的多个值/范围
     for part in field.split(',') {
-        if let Ok(n) = part.trim().parse::<i32>() {
+        let part = part.trim();
+
+        // 范围 N-M
+        if let Some(dash_pos) = part.find('-') {
+            if let (Ok(start), Ok(end)) = (part[..dash_pos].parse::<i32>(), part[dash_pos+1..].parse::<i32>()) {
+                if value >= start && value <= end {
+                    return true;
+                }
+                continue;
+            }
+        }
+
+        // 具体数值
+        if let Ok(n) = part.parse::<i32>() {
             if value == n {
                 return true;
             }
@@ -197,43 +219,9 @@ fn cron_matches(field: &str, value: i32, min: i32, max: i32) -> bool {
 /// 通过 user_id 获取完整的 User 对象
 fn get_user_by_id(db: &rusqlite::Connection, user_id: i64) -> Option<User> {
     db.query_row(
-        "SELECT id, mobile, nickname, query_password, auth_type, appid, token_online, \
-         cookie, cookie_created_at, status, last_query_at, created_at, updated_at, \
-         COALESCE(today_query_data, ''), COALESCE(last_query_data, ''), last_query_time, token, \
-         notify_enabled, notify_type, notify_params, notify_title, notify_subtitle, \
-         notify_content, notify_threshold, query_interval, last_notify_time \
-         FROM users WHERE id = ?1",
+        &format!("SELECT {} FROM users WHERE id = ?1", USER_COLUMNS),
         rusqlite::params![user_id],
-        |row| {
-            Ok(User {
-                id: row.get(0)?,
-                mobile: row.get(1)?,
-                nickname: row.get(2)?,
-                query_password: row.get(3)?,
-                auth_type: row.get(4)?,
-                appid: row.get(5)?,
-                token_online: row.get(6)?,
-                cookie: row.get(7)?,
-                cookie_created_at: row.get(8)?,
-                status: row.get(9)?,
-                last_query_at: row.get(10)?,
-                created_at: row.get(11)?,
-                updated_at: row.get(12)?,
-                today_query_data: row.get(13)?,
-                last_query_data: row.get(14)?,
-                last_query_time: row.get(15)?,
-                token: row.get(16)?,
-                notify_enabled: row.get(17)?,
-                notify_type: row.get(18)?,
-                notify_params: row.get(19)?,
-                notify_title: row.get(20)?,
-                notify_subtitle: row.get(21)?,
-                notify_content: row.get(22)?,
-                notify_threshold: row.get(23)?,
-                query_interval: row.get(24)?,
-                last_notify_time: row.get(25)?,
-            })
-        },
+        |row| User::from_row(row),
     ).ok()
 }
 
@@ -257,7 +245,7 @@ async fn process_single_user(state: &AppState, user: &User) -> anyhow::Result<()
                     error!("发送凭证失效通知失败: {}", ne);
                 }
                 // 更新数据库：标记查询失败
-                if let Err(ue) = update_user_query_state(state, user, &err_msg).await {
+                if let Err(ue) = update_user_query_state(state, user).await {
                     error!("更新用户查询状态失败: {}", ue);
                 }
             }
@@ -340,7 +328,7 @@ async fn process_single_user(state: &AppState, user: &User) -> anyhow::Result<()
 
     // ── 8. 保存到数据库 ──
     {
-        let db = state.db.get().unwrap();
+        let db = state.db.get().map_err(|e| anyhow::anyhow!("获取数据库连接失败: {}", e))?;
         if is_cross_month {
             // 跨月：重置基准，更新 last_query_time
             db.execute(
@@ -407,7 +395,7 @@ async fn process_single_user(state: &AppState, user: &User) -> anyhow::Result<()
             }
 
             {
-                let db = state.db.get().unwrap();
+                let db = state.db.get().map_err(|e| anyhow::anyhow!("获取数据库连接失败: {}", e))?;
                 db.execute(
                     "UPDATE users SET \
                         last_query_data = ?1, \
@@ -441,8 +429,8 @@ fn is_credential_error(err_msg: &str) -> bool {
 }
 
 /// 更新用户查询失败状态
-async fn update_user_query_state(state: &AppState, user: &User, _err_msg: &str) -> anyhow::Result<()> {
-    let db = state.db.get().unwrap();
+async fn update_user_query_state(state: &AppState, user: &User) -> anyhow::Result<()> {
+    let db = state.db.get().map_err(|e| anyhow::anyhow!("获取数据库连接失败: {}", e))?;
     db.execute(
         "UPDATE users SET last_query_at = datetime('now', 'localtime') WHERE id = ?1",
         [user.id],

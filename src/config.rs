@@ -15,7 +15,7 @@ pub struct Config {
     pub notify: NotifyConfig,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct UnicomConfig {
     #[serde(default = "default_login_url")]
     pub login_url: String,
@@ -33,10 +33,26 @@ pub struct UnicomConfig {
     pub cookie_ttl: u64,
 }
 
+impl Default for UnicomConfig {
+    fn default() -> Self {
+        Self {
+            login_url: default_login_url(),
+            query_url: default_query_url(),
+            balance_url: default_balance_url(),
+            timeout: default_timeout(),
+            connect_timeout: default_connect_timeout(),
+            user_agent: default_user_agent(),
+            cookie_ttl: default_cookie_ttl(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct NotifyConfig {
     pub telegram_bot_token: Option<String>,
     pub telegram_chat_id: Option<String>,
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
 }
 
 fn default_database_path() -> String { "unicom.db".to_string() }
@@ -55,32 +71,7 @@ impl Config {
             .add_source(File::with_name("config"))
             .build()?;
 
-        let mut cfg: Config = config.try_deserialize()?;
-        
-        // config crate 不会正确应用嵌套结构体的 serde 默认值
-        // 手动填充空字段
-        if cfg.unicom.login_url.is_empty() {
-            cfg.unicom.login_url = default_login_url();
-        }
-        if cfg.unicom.query_url.is_empty() {
-            cfg.unicom.query_url = default_query_url();
-        }
-        if cfg.unicom.balance_url.is_empty() {
-            cfg.unicom.balance_url = default_balance_url();
-        }
-        if cfg.unicom.timeout == 0 {
-            cfg.unicom.timeout = default_timeout();
-        }
-        if cfg.unicom.connect_timeout == 0 {
-            cfg.unicom.connect_timeout = default_connect_timeout();
-        }
-        if cfg.unicom.user_agent.is_empty() {
-            cfg.unicom.user_agent = default_user_agent();
-        }
-        if cfg.unicom.cookie_ttl == 0 {
-            cfg.unicom.cookie_ttl = default_cookie_ttl();
-        }
-        
+        let cfg: Config = config.try_deserialize()?;
         Ok(cfg)
     }
 }

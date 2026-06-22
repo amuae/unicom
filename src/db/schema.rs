@@ -8,6 +8,7 @@ pub fn create_tables(conn: &Connection) -> SqlResult<()> {
             mobile VARCHAR(11) NOT NULL UNIQUE,
             nickname VARCHAR(50) DEFAULT '',
             query_password VARCHAR(255) NOT NULL,
+            login_password_hash VARCHAR(255) DEFAULT '',
             auth_type VARCHAR(20) DEFAULT 'password',
             appid VARCHAR(100) DEFAULT '',
             token_online VARCHAR(255) DEFAULT '',
@@ -47,6 +48,17 @@ pub fn create_tables(conn: &Connection) -> SqlResult<()> {
         );
 
         CREATE INDEX IF NOT EXISTS idx_admins_username ON admins(username);
+
+        CREATE TABLE IF NOT EXISTS admin_sessions (
+            token VARCHAR(64) PRIMARY KEY,
+            admin_id INTEGER NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            expires_at DATETIME NOT NULL,
+            FOREIGN KEY (admin_id) REFERENCES admins(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_admin_sessions_token ON admin_sessions(token);
+        CREATE INDEX IF NOT EXISTS idx_admin_sessions_expires ON admin_sessions(expires_at);
 
         CREATE TABLE IF NOT EXISTS query_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -108,5 +120,24 @@ pub fn create_tables(conn: &Connection) -> SqlResult<()> {
         "
     )?;
 
+    // 迁移：为已有 users 表添加 login_password_hash 列（如果不存在）
+    migrate_add_column(conn, "users", "login_password_hash", "VARCHAR(255) DEFAULT ''")?;
+
+    // 清理过期 admin sessions
+    let _ = conn.execute(
+        "DELETE FROM admin_sessions WHERE expires_at < datetime('now')",
+        [],
+    );
+
     Ok(())
+}
+
+/// 安全地添加列（如果不存在）
+fn migrate_add_column(conn: &Connection, table: &str, column: &str, col_type: &str) -> SqlResult<()> {
+    let sql = format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, col_type);
+    // 如果列已存在，ALTER TABLE 会报错，忽略即可
+    match conn.execute_batch(&sql) {
+        Ok(_) => Ok(()),
+        Err(_) => Ok(()), // 列已存在，忽略
+    }
 }

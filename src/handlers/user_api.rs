@@ -1,9 +1,9 @@
-use actix_web::{get, post, web, HttpResponse};
+use actix_web::{get, post, delete, web, HttpRequest, HttpResponse};
 use serde::Deserialize;
 
 use crate::AppState;
 use crate::services::notify;
-use crate::handlers::query::{perform_query_analysis, query_user_by_token, QueryResponse};
+use crate::handlers::query::{perform_query_analysis, query_user_by_token, extract_user_token, QueryResponse};
 
 #[derive(Deserialize)]
 pub struct SaveConfigRequest {
@@ -24,20 +24,26 @@ pub struct SaveConfigRequest {
 
 // ─────────────────────────────────────────────
 // GET /query/data/{token} — 查询页面数据（返回分析结果）
+// 也支持 Authorization: Bearer <token> header
 // ─────────────────────────────────────────────
 
 #[get("/query/data/{token}")]
 pub async fn query_page_data(
     state: web::Data<AppState>,
     path: web::Path<String>,
+    req: HttpRequest,
 ) -> HttpResponse {
-    let token = path.into_inner();
+    let path_token = path.into_inner();
+    let token = match extract_user_token(&req, Some(&path_token)) {
+        Some(t) => t,
+        None => return HttpResponse::Unauthorized().json(QueryResponse {
+            success: false, data: None, error: Some("缺少认证信息".to_string()),
+        }),
+    };
 
     match perform_query_analysis(&state, &token).await {
         Ok(data) => HttpResponse::Ok().json(QueryResponse {
-            success: true,
-            data: Some(data),
-            error: None,
+            success: true, data: Some(data), error: None,
         }),
         Err(e) => {
             let mut status = if e.contains("用户不存在") {
@@ -46,25 +52,36 @@ pub async fn query_page_data(
                 HttpResponse::InternalServerError()
             };
             status.json(QueryResponse {
-                success: false,
-                data: None,
-                error: Some(e),
+                success: false, data: None, error: Some(e),
             })
         }
     }
 }
 
 // ─────────────────────────────────────────────
-// POST /api/user/{token}/reset — 重置统计基准
+// POST /user/{token}/reset — 重置统计基准
 // ─────────────────────────────────────────────
 
 #[post("/user/{token}/reset")]
 pub async fn reset_baseline(
     state: web::Data<AppState>,
     path: web::Path<String>,
+    req: HttpRequest,
 ) -> HttpResponse {
-    let token = path.into_inner();
-    let db = state.db.get().unwrap();
+    let path_token = path.into_inner();
+    let token = match extract_user_token(&req, Some(&path_token)) {
+        Some(t) => t,
+        None => return HttpResponse::Unauthorized().json(QueryResponse {
+            success: false, data: None, error: Some("缺少认证信息".to_string()),
+        }),
+    };
+
+    let db = match state.db.get() {
+        Ok(db) => db,
+        Err(_) => return HttpResponse::InternalServerError().json(QueryResponse {
+            success: false, data: None, error: Some("数据库连接失败".to_string()),
+        }),
+    };
 
     let user_id: i64 = match db.query_row(
         "SELECT id FROM users WHERE token = ?1 AND status = 'active'",
@@ -74,9 +91,7 @@ pub async fn reset_baseline(
         Ok(id) => id,
         Err(_) => {
             return HttpResponse::NotFound().json(QueryResponse {
-                success: false,
-                data: None,
-                error: Some("用户不存在或已被禁用".to_string()),
+                success: false, data: None, error: Some("用户不存在或已被禁用".to_string()),
             });
         }
     };
@@ -86,9 +101,7 @@ pub async fn reset_baseline(
         [user_id],
     ) {
         return HttpResponse::InternalServerError().json(QueryResponse {
-            success: false,
-            data: None,
-            error: Some(format!("重置失败: {}", e)),
+            success: false, data: None, error: Some(format!("重置失败: {}", e)),
         });
     }
 
@@ -100,16 +113,29 @@ pub async fn reset_baseline(
 }
 
 // ─────────────────────────────────────────────
-// GET /api/user/{token}/config — 获取用户配置
+// GET /user/{token}/config — 获取用户配置
 // ─────────────────────────────────────────────
 
 #[get("/user/{token}/config")]
 pub async fn get_user_config(
     state: web::Data<AppState>,
     path: web::Path<String>,
+    req: HttpRequest,
 ) -> HttpResponse {
-    let token = path.into_inner();
-    let db = state.db.get().unwrap();
+    let path_token = path.into_inner();
+    let token = match extract_user_token(&req, Some(&path_token)) {
+        Some(t) => t,
+        None => return HttpResponse::Unauthorized().json(QueryResponse {
+            success: false, data: None, error: Some("缺少认证信息".to_string()),
+        }),
+    };
+
+    let db = match state.db.get() {
+        Ok(db) => db,
+        Err(_) => return HttpResponse::InternalServerError().json(QueryResponse {
+            success: false, data: None, error: Some("数据库连接失败".to_string()),
+        }),
+    };
 
     let result = db.query_row(
         "SELECT id, mobile, nickname, query_password, auth_type, appid, token_online, cookie, token, \
@@ -144,20 +170,16 @@ pub async fn get_user_config(
 
     match result {
         Ok(data) => HttpResponse::Ok().json(QueryResponse {
-            success: true,
-            data: Some(data),
-            error: None,
+            success: true, data: Some(data), error: None,
         }),
         Err(_) => HttpResponse::NotFound().json(QueryResponse {
-            success: false,
-            data: None,
-            error: Some("用户不存在".to_string()),
+            success: false, data: None, error: Some("用户不存在".to_string()),
         }),
     }
 }
 
 // ─────────────────────────────────────────────
-// POST /api/user/{token}/config — 保存用户配置
+// POST /user/{token}/config — 保存用户配置
 // ─────────────────────────────────────────────
 
 #[post("/user/{token}/config")]
@@ -165,9 +187,22 @@ pub async fn save_user_config(
     state: web::Data<AppState>,
     path: web::Path<String>,
     body: web::Json<SaveConfigRequest>,
+    req: HttpRequest,
 ) -> HttpResponse {
-    let token = path.into_inner();
-    let db = state.db.get().unwrap();
+    let path_token = path.into_inner();
+    let token = match extract_user_token(&req, Some(&path_token)) {
+        Some(t) => t,
+        None => return HttpResponse::Unauthorized().json(QueryResponse {
+            success: false, data: None, error: Some("缺少认证信息".to_string()),
+        }),
+    };
+
+    let db = match state.db.get() {
+        Ok(db) => db,
+        Err(_) => return HttpResponse::InternalServerError().json(QueryResponse {
+            success: false, data: None, error: Some("数据库连接失败".to_string()),
+        }),
+    };
 
     let user_id: i64 = match db.query_row(
         "SELECT id FROM users WHERE token = ?1",
@@ -177,9 +212,7 @@ pub async fn save_user_config(
         Ok(id) => id,
         Err(_) => {
             return HttpResponse::NotFound().json(QueryResponse {
-                success: false,
-                data: None,
-                error: Some("用户不存在".to_string()),
+                success: false, data: None, error: Some("用户不存在".to_string()),
             });
         }
     };
@@ -247,9 +280,7 @@ pub async fn save_user_config(
 
     if updates.is_empty() {
         return HttpResponse::BadRequest().json(QueryResponse {
-            success: false,
-            data: None,
-            error: Some("没有要更新的字段".to_string()),
+            success: false, data: None, error: Some("没有要更新的字段".to_string()),
         });
     }
 
@@ -259,14 +290,11 @@ pub async fn save_user_config(
 
     if let Err(e) = db.execute(&sql, rusqlite::params_from_iter(params.iter())) {
         return HttpResponse::InternalServerError().json(QueryResponse {
-            success: false,
-            data: None,
-            error: Some(format!("保存配置失败: {}", e)),
+            success: false, data: None, error: Some(format!("保存配置失败: {}", e)),
         });
     }
 
     // ── 检查是否需要创建/删除定时任务 ──
-    // 查询用户当前配置
     let user_config: Option<(String, i32, i32)> = db.query_row(
         "SELECT COALESCE(notify_type, ''), COALESCE(notify_threshold, 0), COALESCE(query_interval, 5) \
          FROM users WHERE id = ?1",
@@ -275,14 +303,12 @@ pub async fn save_user_config(
     ).ok();
 
     if let Some((notify_type, notify_threshold, query_interval)) = user_config {
-        // 检查三项条件：通知方式正确、通知阈值已配置、查询间隔已配置
         let should_have_cron = !notify_type.is_empty() 
             && notify_type != "none"
             && notify_threshold > 0 
             && query_interval > 0;
 
         if should_have_cron {
-            // 生成 cron 表达式（根据 query_interval）
             let cron_expr = if query_interval >= 60 {
                 let hours = query_interval / 60;
                 format!("0 0 */{} * * *", hours)
@@ -290,14 +316,12 @@ pub async fn save_user_config(
                 format!("0 */{} * * * *", query_interval)
             };
 
-            // 获取用户手机号
             let mobile: String = db.query_row(
                 "SELECT mobile FROM users WHERE id = ?1",
                 [user_id],
                 |row| row.get(0),
             ).unwrap_or_default();
 
-            // 插入或更新定时任务
             let _ = db.execute(
                 "INSERT INTO user_cron_tasks (user_id, mobile, cron_expression, status) \
                  VALUES (?1, ?2, ?3, 'active') \
@@ -308,7 +332,6 @@ pub async fn save_user_config(
 
             tracing::info!("用户 {} 定时任务已创建/更新: {}", mobile, cron_expr);
         } else {
-            // 条件不满足，删除该用户的定时任务
             let _ = db.execute(
                 "DELETE FROM user_cron_tasks WHERE user_id = ?1",
                 [user_id],
@@ -326,19 +349,31 @@ pub async fn save_user_config(
 }
 
 // ─────────────────────────────────────────────
-// POST /api/user/{token}/test-notify — 测试通知
+// POST /user/{token}/test-notify — 测试通知
 // ─────────────────────────────────────────────
 
 #[post("/user/{token}/test-notify")]
 pub async fn test_notify(
     state: web::Data<AppState>,
     path: web::Path<String>,
+    req: HttpRequest,
 ) -> HttpResponse {
-    let token = path.into_inner();
+    let path_token = path.into_inner();
+    let token = match extract_user_token(&req, Some(&path_token)) {
+        Some(t) => t,
+        None => return HttpResponse::Unauthorized().json(QueryResponse {
+            success: false, data: None, error: Some("缺少认证信息".to_string()),
+        }),
+    };
 
     // 在锁外获取用户（避免持锁进行网络请求）
     let user = {
-        let db = state.db.get().unwrap();
+        let db = match state.db.get() {
+            Ok(db) => db,
+            Err(_) => return HttpResponse::InternalServerError().json(QueryResponse {
+                success: false, data: None, error: Some("数据库连接失败".to_string()),
+            }),
+        };
         query_user_by_token(&db, &token)
     };
 
@@ -346,9 +381,7 @@ pub async fn test_notify(
         Ok(u) => u,
         Err(_) => {
             return HttpResponse::NotFound().json(QueryResponse {
-                success: false,
-                data: None,
-                error: Some("用户不存在或已被禁用".to_string()),
+                success: false, data: None, error: Some("用户不存在或已被禁用".to_string()),
             });
         }
     };
@@ -360,15 +393,13 @@ pub async fn test_notify(
             error: None,
         }),
         Err(e) => HttpResponse::InternalServerError().json(QueryResponse {
-            success: false,
-            data: None,
-            error: Some(format!("发送测试通知失败: {}", e)),
+            success: false, data: None, error: Some(format!("发送测试通知失败: {}", e)),
         }),
     }
 }
 
 // ─────────────────────────────────────────────
-// GET /api/user/{token}/page — 返回查询页面 HTML
+// GET /user/{token}/page — 返回查询页面 HTML
 // ─────────────────────────────────────────────
 
 #[get("/user/{token}/page")]
@@ -393,13 +424,26 @@ pub async fn serve_page(
 // DELETE /user/{token} — 用户自行删除账号
 // ─────────────────────────────────────────────
 
-#[actix_web::delete("/user/{token}")]
+#[delete("/user/{token}")]
 pub async fn delete_user_by_token(
     state: web::Data<AppState>,
     path: web::Path<String>,
+    req: HttpRequest,
 ) -> HttpResponse {
-    let token = path.into_inner();
-    let db = state.db.get().unwrap();
+    let path_token = path.into_inner();
+    let token = match extract_user_token(&req, Some(&path_token)) {
+        Some(t) => t,
+        None => return HttpResponse::Unauthorized().json(QueryResponse {
+            success: false, data: None, error: Some("缺少认证信息".to_string()),
+        }),
+    };
+
+    let db = match state.db.get() {
+        Ok(db) => db,
+        Err(_) => return HttpResponse::InternalServerError().json(QueryResponse {
+            success: false, data: None, error: Some("数据库连接失败".to_string()),
+        }),
+    };
 
     let result = db.execute(
         "DELETE FROM users WHERE token = ?1",
@@ -420,14 +464,10 @@ pub async fn delete_user_by_token(
             })
         }
         Ok(_) => HttpResponse::NotFound().json(QueryResponse {
-            success: false,
-            data: None,
-            error: Some("用户不存在".to_string()),
+            success: false, data: None, error: Some("用户不存在".to_string()),
         }),
         Err(e) => HttpResponse::InternalServerError().json(QueryResponse {
-            success: false,
-            data: None,
-            error: Some(format!("删除失败: {}", e)),
+            success: false, data: None, error: Some(format!("删除失败: {}", e)),
         }),
     }
 }

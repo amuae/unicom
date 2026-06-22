@@ -28,7 +28,12 @@ pub async fn get_user_config(
     path: web::Path<String>,
 ) -> HttpResponse {
     let token = path.into_inner();
-    let db = state.db.get().unwrap();
+    let db = match state.db.get() {
+        Ok(db) => db,
+        Err(_) => return HttpResponse::InternalServerError().json(UserConfigResponse {
+            success: false, data: None, error: Some("数据库连接失败".to_string()),
+        }),
+    };
 
     let result = db.query_row(
         "SELECT id, mobile, nickname, auth_type, appid, token_online, cookie, token, \
@@ -58,14 +63,10 @@ pub async fn get_user_config(
 
     match result {
         Ok(data) => HttpResponse::Ok().json(UserConfigResponse {
-            success: true,
-            data: Some(data),
-            error: None,
+            success: true, data: Some(data), error: None,
         }),
         Err(_) => HttpResponse::NotFound().json(UserConfigResponse {
-            success: false,
-            data: None,
-            error: Some("用户不存在".to_string()),
+            success: false, data: None, error: Some("用户不存在".to_string()),
         }),
     }
 }
@@ -77,7 +78,12 @@ pub async fn update_user_config(
     body: web::Json<UpdateConfigRequest>,
 ) -> HttpResponse {
     let token = path.into_inner();
-    let db = state.db.get().unwrap();
+    let db = match state.db.get() {
+        Ok(db) => db,
+        Err(_) => return HttpResponse::InternalServerError().json(UserConfigResponse {
+            success: false, data: None, error: Some("数据库连接失败".to_string()),
+        }),
+    };
 
     // 验证用户存在
     let user_id: i64 = match db.query_row(
@@ -88,9 +94,7 @@ pub async fn update_user_config(
         Ok(id) => id,
         Err(_) => {
             return HttpResponse::NotFound().json(UserConfigResponse {
-                success: false,
-                data: None,
-                error: Some("用户不存在".to_string()),
+                success: false, data: None, error: Some("用户不存在".to_string()),
             });
         }
     };
@@ -140,9 +144,7 @@ pub async fn update_user_config(
 
     if updates.is_empty() {
         return HttpResponse::BadRequest().json(UserConfigResponse {
-            success: false,
-            data: None,
-            error: Some("没有要更新的字段".to_string()),
+            success: false, data: None, error: Some("没有要更新的字段".to_string()),
         });
     }
 
@@ -150,11 +152,14 @@ pub async fn update_user_config(
     let sql = format!("UPDATE users SET {} WHERE id = ?", updates.join(", "));
     params.push(Box::new(user_id));
 
-    db.execute(&sql, rusqlite::params_from_iter(params.iter())).unwrap();
-
-    HttpResponse::Ok().json(UserConfigResponse {
-        success: true,
-        data: Some(serde_json::json!({"message": "配置已更新"})),
-        error: None,
-    })
+    match db.execute(&sql, rusqlite::params_from_iter(params.iter())) {
+        Ok(_) => HttpResponse::Ok().json(UserConfigResponse {
+            success: true,
+            data: Some(serde_json::json!({"message": "配置已更新"})),
+            error: None,
+        }),
+        Err(e) => HttpResponse::InternalServerError().json(UserConfigResponse {
+            success: false, data: None, error: Some(format!("更新失败: {}", e)),
+        }),
+    }
 }
