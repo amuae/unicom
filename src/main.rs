@@ -76,10 +76,13 @@ impl RateLimiter {
 // 工具函数
 // ═══════════════════════════════════════════════
 
+/// 读取一行输入，EOF 时返回空字符串
 fn read_line() -> String {
     let mut input = String::new();
-    io::stdin().read_line(&mut input).unwrap();
-    input.trim().to_string()
+    match io::stdin().read_line(&mut input) {
+        Ok(0) | Err(_) => String::new(), // EOF 或错误
+        Ok(_) => input.trim().to_string(),
+    }
 }
 
 fn get_pid() -> Option<u32> {
@@ -129,6 +132,12 @@ fn get_install_dir() -> String {
         .unwrap_or_else(|| ".".to_string())
 }
 
+/// 清屏
+fn clear_screen() {
+    print!("\x1B[2J\x1B[H");
+    io::stdout().flush().ok();
+}
+
 // ═══════════════════════════════════════════════
 // 快捷指令
 // ═══════════════════════════════════════════════
@@ -156,7 +165,13 @@ fn cmd_version() {
 }
 
 fn cmd_status() {
-    let config = config::Config::load().expect("Failed to load config");
+    let config = match config::Config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            println!("❌ 加载配置失败: {}", e);
+            return;
+        }
+    };
     println!("Unicom v{}", VERSION);
     println!("  地址: {}:{}", config.host, config.port);
     println!("  数据库: {}", config.database_path);
@@ -169,6 +184,7 @@ fn cmd_status() {
             let status_path = format!("/proc/{}/status", pid);
             let stat_path = format!("/proc/{}/stat", pid);
             
+            // 内存信息
             if let Ok(content) = std::fs::read_to_string(&status_path) {
                 for line in content.lines() {
                     if line.starts_with("VmRSS:") {
@@ -185,6 +201,9 @@ fn cmd_status() {
                 }
             }
             
+            // CPU 占用率（采样 500ms）
+            print!("  CPU: 采样中...");
+            io::stdout().flush().ok();
             if let (Ok(content1), Ok(sys1)) = (
                 std::fs::read_to_string(&stat_path),
                 std::fs::read_to_string("/proc/stat"),
@@ -220,13 +239,14 @@ fn cmd_status() {
 
                     if sys_delta > 0.0 {
                         let cpu_pct = proc_delta / sys_delta * 100.0;
-                        println!("  CPU: {:.1}%", cpu_pct);
+                        print!("\r  CPU: {:.1}%    \n", cpu_pct);
                     } else {
-                        println!("  CPU: 0.0%");
+                        print!("\r  CPU: 0.0%    \n");
                     }
                 }
             }
             
+            // 运行时间
             if let Ok(content) = std::fs::read_to_string(&stat_path) {
                 let fields: Vec<&str> = content.split_whitespace().collect();
                 if fields.len() > 21 {
@@ -264,9 +284,10 @@ fn cmd_status() {
 
 fn cmd_start() {
     if is_running() {
-        println!("服务已在运行中 (PID: {})", get_pid().unwrap());
+        println!("服务已在运行中 (PID: {})", get_pid().unwrap_or(0));
         return;
     }
+
     let android_script = "/data/adb/service.d/unicom.sh";
     if std::path::Path::new(android_script).exists() {
         println!("启动服务...");
@@ -276,7 +297,7 @@ fn cmd_start() {
             .ok();
         std::thread::sleep(std::time::Duration::from_secs(3));
         if is_running() {
-            println!("✅ 启动成功 (PID: {})", get_pid().unwrap());
+            println!("✅ 启动成功 (PID: {})", get_pid().unwrap_or(0));
         } else {
             println!("❌ 启动失败，请查看日志");
         }
@@ -313,15 +334,22 @@ fn cmd_start() {
     #[cfg(not(target_os = "windows"))]
     {
         let exe = format!("{}/unicom", install_dir);
-        std::process::Command::new(&exe)
+        match std::process::Command::new(&exe)
             .current_dir(&install_dir)
             .spawn()
-            .expect("Failed to start");
-        std::thread::sleep(std::time::Duration::from_secs(1));
-        if is_running() {
-            println!("✅ 启动成功 (PID: {})", get_pid().unwrap());
-        } else {
-            println!("❌ 启动失败，请查看日志");
+        {
+            Ok(_) => {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                if is_running() {
+                    println!("✅ 启动成功 (PID: {})", get_pid().unwrap_or(0));
+                } else {
+                    println!("❌ 启动失败，请查看日志");
+                }
+            }
+            Err(e) => {
+                println!("❌ 启动失败: {}", e);
+                println!("  确保 {} 存在且有执行权限", exe);
+            }
         }
     }
 }
@@ -359,11 +387,13 @@ fn cmd_stop() {
             }
             #[cfg(not(target_os = "windows"))]
             {
+                // 先尝试 SIGTERM
                 std::process::Command::new("kill")
                     .arg(pid.to_string())
                     .status()
                     .ok();
                 std::thread::sleep(std::time::Duration::from_secs(2));
+                // 如果还在运行，用 SIGKILL
                 if is_running() {
                     println!("SIGTERM 无效，尝试 SIGKILL...");
                     std::process::Command::new("kill")
@@ -392,10 +422,23 @@ fn cmd_restart() {
 }
 
 fn cmd_reset_pass() {
-    let config = config::Config::load().expect("Failed to load config");
-    let conn = rusqlite::Connection::open(&config.database_path).expect("Failed to open database");
+    let config = match config::Config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            println!("❌ 加载配置失败: {}", e);
+            return;
+        }
+    };
+    let conn = match rusqlite::Connection::open(&config.database_path) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("❌ 打开数据库失败: {}", e);
+            return;
+        }
+    };
     conn.execute_batch("PRAGMA foreign_keys = ON;").ok();
 
+    // 使用密码学安全随机数生成用户名和密码
     use rand::Rng;
     let mut rng = rand::rngs::OsRng;
     let chars: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
@@ -409,7 +452,13 @@ fn cmd_reset_pass() {
     }).collect();
     let username = format!("admin_{}", username);
 
-    let hashed = bcrypt::hash(&password, bcrypt::DEFAULT_COST).unwrap();
+    let hashed = match bcrypt::hash(&password, bcrypt::DEFAULT_COST) {
+        Ok(h) => h,
+        Err(e) => {
+            println!("❌ 密码哈希失败: {}", e);
+            return;
+        }
+    };
 
     let admin_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM admins", [], |row| row.get(0))
@@ -449,32 +498,34 @@ fn cmd_reset_pass() {
 
 fn show_main_menu() {
     let status = if is_running() {
-        format!("运行中 (PID: {})", get_pid().unwrap())
+        format!("运行中 (PID: {})", get_pid().unwrap_or(0))
     } else {
         "未运行".to_string()
     };
 
-    println!("\n┌───────────────────────────────────┐");
-    println!("│     Unicom 联通流量查询系统       │");
-    println!("│            v{:<20}│", VERSION);
-    println!("├───────────────────────────────────┤");
-    println!("│  状态: {:<26}│", status);
-    println!("├───────────────────────────────────┤");
-    println!("│  1. 启动服务                      │");
-    println!("│  2. 重启服务                      │");
-    println!("│  3. 停止服务                      │");
-    println!("│  4. 运行状态                      │");
-    println!("│  5. 管理账密                      │");
-    println!("│  6. 检查更新                      │");
-    println!("│  7. 卸载程序                      │");
-    println!("│  0. 退出                          │");
-    println!("└───────────────────────────────────┘");
+    println!();
+    println!("┌─────────────────────────────────────┐");
+    println!("│      Unicom 联通流量查询系统        │");
+    println!("│             v{:<21}│", VERSION);
+    println!("├─────────────────────────────────────┤");
+    println!("│  状态: {:<28}│", status);
+    println!("├─────────────────────────────────────┤");
+    println!("│  1. 启动服务                        │");
+    println!("│  2. 重启服务                        │");
+    println!("│  3. 停止服务                        │");
+    println!("│  4. 运行状态                        │");
+    println!("│  5. 管理账密                        │");
+    println!("│  6. 检查更新                        │");
+    println!("│  7. 卸载程序                        │");
+    println!("│  0. 退出                            │");
+    println!("└─────────────────────────────────────┘");
     print!("请选择: ");
-    io::stdout().flush().unwrap();
+    io::stdout().flush().ok();
 }
 
 fn show_admin_menu() {
-    println!("\n┌─────────────────────────────────────┐");
+    println!();
+    println!("┌─────────────────────────────────────┐");
     println!("│           管理员账密                │");
     println!("├─────────────────────────────────────┤");
     println!("│  1. 重置管理员账密                  │");
@@ -482,17 +533,34 @@ fn show_admin_menu() {
     println!("│  0. 返回                            │");
     println!("└─────────────────────────────────────┘");
     print!("请选择: ");
-    io::stdout().flush().unwrap();
+    io::stdout().flush().ok();
 }
 
 fn list_admins() {
-    let config = config::Config::load().expect("Failed to load config");
-    let conn = rusqlite::Connection::open(&config.database_path).expect("Failed to open database");
+    let config = match config::Config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            println!("❌ 加载配置失败: {}", e);
+            return;
+        }
+    };
+    let conn = match rusqlite::Connection::open(&config.database_path) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("❌ 打开数据库失败: {}", e);
+            return;
+        }
+    };
+    conn.execute_batch("PRAGMA foreign_keys = ON;").ok();
 
     println!("\n=== 管理员列表 ===");
-    let mut stmt = conn
-        .prepare("SELECT id, username, real_name FROM admins")
-        .expect("Failed to prepare");
+    let mut stmt = match conn.prepare("SELECT id, username, real_name FROM admins") {
+        Ok(s) => s,
+        Err(e) => {
+            println!("❌ 查询失败: {}", e);
+            return;
+        }
+    };
 
     let rows = stmt.query_map([], |row| {
         Ok((
@@ -500,17 +568,30 @@ fn list_admins() {
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
         ))
-    }).expect("Failed to query");
+    });
 
-    let mut count = 0;
-    for row in rows {
-        let (id, username, real_name) = row.unwrap();
-        println!("  {}. {} ({})", id, username, if real_name.is_empty() { "-" } else { &real_name });
-        count += 1;
-    }
-
-    if count == 0 {
-        println!("  暂无管理员");
+    match rows {
+        Ok(rows) => {
+            let mut count = 0;
+            for row in rows {
+                match row {
+                    Ok((id, username, real_name)) => {
+                        let display_name = if real_name.is_empty() { "-" } else { &real_name };
+                        println!("  {}. {} ({})", id, username, display_name);
+                        count += 1;
+                    }
+                    Err(e) => {
+                        println!("  ⚠️  读取行失败: {}", e);
+                    }
+                }
+            }
+            if count == 0 {
+                println!("  暂无管理员");
+            }
+        }
+        Err(e) => {
+            println!("❌ 查询失败: {}", e);
+        }
     }
 }
 
@@ -531,14 +612,18 @@ fn do_update() {
         println!("  curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/amuae/unicom/main/deploy.sh | sh");
         println!();
         print!("是否现在执行？(y/N): ");
-        io::stdout().flush().unwrap();
+        io::stdout().flush().ok();
 
         if read_line().to_lowercase() == "y" {
             println!("正在更新...");
-            std::process::Command::new("sh")
+            match std::process::Command::new("sh")
                 .args(["-c", "curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/amuae/unicom/main/deploy.sh | sh"])
                 .status()
-                .ok();
+            {
+                Ok(status) if status.success() => println!("✅ 更新完成"),
+                Ok(status) => println!("⚠️  更新脚本退出码: {}", status.code().unwrap_or(-1)),
+                Err(e) => println!("❌ 执行更新脚本失败: {}", e),
+            }
         }
     }
 }
@@ -553,12 +638,15 @@ fn do_uninstall() {
     println!("  - 删除所有文件（包括数据库）");
     println!();
     print!("确认卸载？(输入 yes): ");
-    io::stdout().flush().unwrap();
+    io::stdout().flush().ok();
 
     if read_line() == "yes" {
         cmd_stop();
         println!("删除文件...");
-        std::fs::remove_dir_all(&install_dir).ok();
+        match std::fs::remove_dir_all(&install_dir) {
+            Ok(_) => {}
+            Err(e) => println!("⚠️  删除文件失败: {}", e),
+        }
 
         let service_script = "/data/adb/service.d/unicom.sh";
         if std::path::Path::new(service_script).exists() {
@@ -579,6 +667,7 @@ fn handle_admin_menu() {
             "1" => cmd_reset_pass(),
             "2" => list_admins(),
             "0" | "q" => break,
+            "" => break, // EOF
             _ => println!("无效选择"),
         }
     }
@@ -586,6 +675,7 @@ fn handle_admin_menu() {
 
 fn interactive_menu() {
     loop {
+        clear_screen();
         show_main_menu();
         match read_line().as_str() {
             "1" => cmd_start(),
@@ -599,8 +689,16 @@ fn interactive_menu() {
                 println!("退出");
                 std::process::exit(0);
             }
+            "" => {
+                // EOF — 非交互环境，直接启动服务
+                break;
+            }
             _ => println!("无效选择"),
         }
+        // 操作完成后暂停，等待用户按回车
+        print!("\n按回车返回菜单...");
+        io::stdout().flush().ok();
+        read_line();
     }
 }
 
@@ -641,6 +739,8 @@ async fn main() -> std::io::Result<()> {
     
     if has_tty {
         interactive_menu();
+        // interactive_menu 只在用户选 0 时 exit，EOF 时 break 到这里
+        // break 后继续启动服务（用户从菜单选 start 后也会到这里）
     }
 
     // 加载配置
@@ -693,17 +793,14 @@ async fn main() -> std::io::Result<()> {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
         loop {
             interval.tick().await;
-            // 清理 rate limiter
             {
                 let mut rl = cleanup_rl.lock().unwrap();
                 rl.cleanup();
             }
-            // 清理 session 缓存
             {
                 let mut sc = cleanup_sc.lock().unwrap();
                 sc.cleanup();
             }
-            // 清理 DB 中的过期 session
             if let Ok(conn) = cleanup_db.get() {
                 let _ = conn.execute(
                     "DELETE FROM admin_sessions WHERE expires_at < datetime('now')",
