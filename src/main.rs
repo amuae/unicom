@@ -29,13 +29,9 @@ pub struct AppState {
     pub session_cache: Arc<Mutex<handlers::auth::SessionCache>>,
 }
 
-/// 简单的内存速率限制器（IP → 最近请求记录）
 pub struct RateLimiter {
-    /// IP → (请求次数, 窗口开始时间)
     attempts: HashMap<String, (u32, Instant)>,
-    /// 最大请求数（每个窗口）
     max_requests: u32,
-    /// 窗口时长（秒）
     window_secs: u64,
 }
 
@@ -48,22 +44,17 @@ impl RateLimiter {
         }
     }
 
-    /// 检查是否超过速率限制，返回 true 表示允许，false 表示拒绝
     fn check(&mut self, key: &str) -> bool {
         let now = Instant::now();
         let entry = self.attempts.entry(key.to_string()).or_insert((0, now));
-
-        // 窗口过期，重置
         if now.duration_since(entry.1).as_secs() >= self.window_secs {
             *entry = (1, now);
             return true;
         }
-
         entry.0 += 1;
         entry.0 <= self.max_requests
     }
 
-    /// 清理过期条目
     pub fn cleanup(&mut self) {
         let now = Instant::now();
         self.attempts.retain(|_, (_, start)| {
@@ -76,11 +67,10 @@ impl RateLimiter {
 // 工具函数
 // ═══════════════════════════════════════════════
 
-/// 读取一行输入，EOF 时返回空字符串
 fn read_line() -> String {
     let mut input = String::new();
     match io::stdin().read_line(&mut input) {
-        Ok(0) | Err(_) => String::new(), // EOF 或错误
+        Ok(0) | Err(_) => String::new(),
         Ok(_) => input.trim().to_string(),
     }
 }
@@ -125,6 +115,17 @@ fn is_running() -> bool {
     get_pid().is_some()
 }
 
+/// 检查服务是否由 systemd 管理
+fn is_systemd_managed() -> bool {
+    std::process::Command::new("systemctl")
+        .args(["is-active", "--quiet", "unicom"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 fn get_install_dir() -> String {
     std::env::current_exe()
         .ok()
@@ -132,7 +133,6 @@ fn get_install_dir() -> String {
         .unwrap_or_else(|| ".".to_string())
 }
 
-/// 清屏
 fn clear_screen() {
     print!("\x1B[2J\x1B[H");
     io::stdout().flush().ok();
@@ -167,14 +167,17 @@ fn cmd_version() {
 fn cmd_status() {
     let config = match config::Config::load() {
         Ok(c) => c,
-        Err(e) => {
-            println!("❌ 加载配置失败: {}", e);
-            return;
-        }
+        Err(e) => { println!("❌ 加载配置失败: {}", e); return; }
     };
     println!("Unicom v{}", VERSION);
     println!("  地址: {}:{}", config.host, config.port);
     println!("  数据库: {}", config.database_path);
+
+    // 显示服务管理方式
+    if is_systemd_managed() {
+        println!("  管理: systemd");
+    }
+
     match get_pid() {
         Some(pid) => {
             println!("  状态: ✅ 运行中 (PID: {})", pid);
@@ -184,7 +187,6 @@ fn cmd_status() {
             let status_path = format!("/proc/{}/status", pid);
             let stat_path = format!("/proc/{}/stat", pid);
             
-            // 内存信息
             if let Ok(content) = std::fs::read_to_string(&status_path) {
                 for line in content.lines() {
                     if line.starts_with("VmRSS:") {
@@ -201,7 +203,6 @@ fn cmd_status() {
                 }
             }
             
-            // CPU 占用率（采样 500ms）
             print!("  CPU: 采样中...");
             io::stdout().flush().ok();
             if let (Ok(content1), Ok(sys1)) = (
@@ -246,18 +247,14 @@ fn cmd_status() {
                 }
             }
             
-            // 运行时间
             if let Ok(content) = std::fs::read_to_string(&stat_path) {
                 let fields: Vec<&str> = content.split_whitespace().collect();
                 if fields.len() > 21 {
                     let starttime: u64 = fields[21].parse().unwrap_or(0);
                     if let Ok(uptime_content) = std::fs::read_to_string("/proc/uptime") {
                         let uptime_secs: f64 = uptime_content
-                            .split_whitespace()
-                            .next()
-                            .unwrap_or("0")
-                            .parse()
-                            .unwrap_or(0.0);
+                            .split_whitespace().next().unwrap_or("0")
+                            .parse().unwrap_or(0.0);
                         let hz = 100.0;
                         let start_secs = starttime as f64 / hz;
                         let run_secs = uptime_secs - start_secs;
@@ -276,10 +273,32 @@ fn cmd_status() {
                     }
                 }
             }
-            } // end #[cfg(not(target_os = "windows"))]
+            } // cfg
         }
         None => println!("  状态: ❌ 未运行"),
     }
+}
+
+/// 通过 systemd 停止服务（推荐）
+fn stop_via_systemd() -> bool {
+    std::process::Command::new("systemctl")
+        .args(["stop", "unicom"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// 通过 systemd 启动服务
+fn start_via_systemd() -> bool {
+    std::process::Command::new("systemctl")
+        .args(["start", "unicom"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 fn cmd_start() {
@@ -288,13 +307,13 @@ fn cmd_start() {
         return;
     }
 
+    // Android: 使用 service.d 脚本
     let android_script = "/data/adb/service.d/unicom.sh";
     if std::path::Path::new(android_script).exists() {
         println!("启动服务...");
         std::process::Command::new("sh")
             .args([android_script, "start"])
-            .status()
-            .ok();
+            .status().ok();
         std::thread::sleep(std::time::Duration::from_secs(3));
         if is_running() {
             println!("✅ 启动成功 (PID: {})", get_pid().unwrap_or(0));
@@ -304,6 +323,23 @@ fn cmd_start() {
         return;
     }
 
+    // systemd 管理的服务：用 systemctl
+    if is_systemd_managed() {
+        println!("通过 systemd 启动服务...");
+        if start_via_systemd() {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            if is_running() {
+                println!("✅ 启动成功 (PID: {})", get_pid().unwrap_or(0));
+            } else {
+                println!("❌ 启动失败，请查看日志: journalctl -u unicom -n 20");
+            }
+        } else {
+            println!("❌ systemd 启动失败");
+        }
+        return;
+    }
+
+    // 手动模式：spawn 子进程
     println!("启动服务...");
     let install_dir = get_install_dir();
     #[cfg(target_os = "windows")]
@@ -327,7 +363,6 @@ fn cmd_start() {
             }
             Err(e) => {
                 println!("❌ 启动失败: {}", e);
-                println!("  确保 unicom.exe 在 {} 目录下", install_dir);
             }
         }
     }
@@ -336,6 +371,9 @@ fn cmd_start() {
         let exe = format!("{}/unicom", install_dir);
         match std::process::Command::new(&exe)
             .current_dir(&install_dir)
+            .stdin(std::process::Stdio::null()) // 关键：不让子进程进入菜单
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
         {
             Ok(_) => {
@@ -355,24 +393,39 @@ fn cmd_start() {
 }
 
 fn cmd_stop() {
+    // Android
     let android_script = "/data/adb/service.d/unicom.sh";
     if std::path::Path::new(android_script).exists() {
         println!("停止服务...");
         std::process::Command::new("sh")
             .args([android_script, "stop"])
-            .status()
-            .ok();
+            .status().ok();
         std::thread::sleep(std::time::Duration::from_secs(1));
         let pid_file = format!("{}/unicom.pid", get_install_dir());
         std::fs::remove_file(&pid_file).ok();
-        if !is_running() {
-            println!("✅ 已停止");
+        if !is_running() { println!("✅ 已停止"); } else { println!("❌ 停止失败"); }
+        return;
+    }
+
+    // systemd 管理
+    if is_systemd_managed() {
+        println!("通过 systemd 停止服务...");
+        if stop_via_systemd() {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let pid_file = format!("{}/unicom.pid", get_install_dir());
+            std::fs::remove_file(&pid_file).ok();
+            if !is_running() {
+                println!("✅ 已停止");
+            } else {
+                println!("❌ 停止失败，请查看: journalctl -u unicom -n 20");
+            }
         } else {
-            println!("❌ 停止失败");
+            println!("❌ systemd 停止失败");
         }
         return;
     }
 
+    // 手动模式：直接 kill PID
     match get_pid() {
         Some(pid) => {
             println!("停止服务 (PID: {})...", pid);
@@ -382,24 +435,23 @@ fn cmd_stop() {
                     .args(["/PID", &pid.to_string(), "/F"])
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
-                    .status()
-                    .ok();
+                    .status().ok();
             }
             #[cfg(not(target_os = "windows"))]
             {
-                // 先尝试 SIGTERM
                 std::process::Command::new("kill")
                     .arg(pid.to_string())
-                    .status()
-                    .ok();
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status().ok();
                 std::thread::sleep(std::time::Duration::from_secs(2));
-                // 如果还在运行，用 SIGKILL
                 if is_running() {
                     println!("SIGTERM 无效，尝试 SIGKILL...");
                     std::process::Command::new("kill")
                         .args(["-9", &pid.to_string()])
-                        .status()
-                        .ok();
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status().ok();
                 }
             }
             std::thread::sleep(std::time::Duration::from_secs(1));
@@ -416,6 +468,23 @@ fn cmd_stop() {
 }
 
 fn cmd_restart() {
+    if is_systemd_managed() {
+        println!("通过 systemd 重启服务...");
+        std::process::Command::new("systemctl")
+            .args(["restart", "unicom"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status().ok();
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        if is_running() {
+            println!("✅ 重启成功 (PID: {})", get_pid().unwrap_or(0));
+        } else {
+            println!("❌ 重启失败，请查看: journalctl -u unicom -n 20");
+        }
+        return;
+    }
+
+    // 手动模式
     cmd_stop();
     std::thread::sleep(std::time::Duration::from_secs(2));
     cmd_start();
@@ -424,45 +493,27 @@ fn cmd_restart() {
 fn cmd_reset_pass() {
     let config = match config::Config::load() {
         Ok(c) => c,
-        Err(e) => {
-            println!("❌ 加载配置失败: {}", e);
-            return;
-        }
+        Err(e) => { println!("❌ 加载配置失败: {}", e); return; }
     };
     let conn = match rusqlite::Connection::open(&config.database_path) {
         Ok(c) => c,
-        Err(e) => {
-            println!("❌ 打开数据库失败: {}", e);
-            return;
-        }
+        Err(e) => { println!("❌ 打开数据库失败: {}", e); return; }
     };
     conn.execute_batch("PRAGMA foreign_keys = ON;").ok();
 
-    // 使用密码学安全随机数生成用户名和密码
     use rand::Rng;
     let mut rng = rand::rngs::OsRng;
     let chars: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let username: String = (0..8).map(|_| {
-        let idx = rng.gen_range(0..chars.len());
-        chars[idx] as char
-    }).collect();
-    let password: String = (0..16).map(|_| {
-        let idx = rng.gen_range(0..chars.len());
-        chars[idx] as char
-    }).collect();
+    let username: String = (0..8).map(|_| { let idx = rng.gen_range(0..chars.len()); chars[idx] as char }).collect();
+    let password: String = (0..16).map(|_| { let idx = rng.gen_range(0..chars.len()); chars[idx] as char }).collect();
     let username = format!("admin_{}", username);
 
     let hashed = match bcrypt::hash(&password, bcrypt::DEFAULT_COST) {
         Ok(h) => h,
-        Err(e) => {
-            println!("❌ 密码哈希失败: {}", e);
-            return;
-        }
+        Err(e) => { println!("❌ 密码哈希失败: {}", e); return; }
     };
 
-    let admin_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM admins", [], |row| row.get(0))
-        .unwrap_or(0);
+    let admin_count: i64 = conn.query_row("SELECT COUNT(*) FROM admins", [], |row| row.get(0)).unwrap_or(0);
 
     let result = if admin_count > 0 {
         conn.execute(
@@ -483,12 +534,8 @@ fn cmd_reset_pass() {
             println!("   密码: {}", password);
             println!("\n⚠️  请立即登录并修改密码！");
         }
-        Ok(_) => {
-            println!("❌ 重置失败：未找到管理员账号");
-        }
-        Err(e) => {
-            println!("❌ 重置失败: {}", e);
-        }
+        Ok(_) => println!("❌ 重置失败：未找到管理员账号"),
+        Err(e) => println!("❌ 重置失败: {}", e),
     }
 }
 
@@ -539,60 +586,35 @@ fn show_admin_menu() {
 fn list_admins() {
     let config = match config::Config::load() {
         Ok(c) => c,
-        Err(e) => {
-            println!("❌ 加载配置失败: {}", e);
-            return;
-        }
+        Err(e) => { println!("❌ 加载配置失败: {}", e); return; }
     };
     let conn = match rusqlite::Connection::open(&config.database_path) {
         Ok(c) => c,
-        Err(e) => {
-            println!("❌ 打开数据库失败: {}", e);
-            return;
-        }
+        Err(e) => { println!("❌ 打开数据库失败: {}", e); return; }
     };
     conn.execute_batch("PRAGMA foreign_keys = ON;").ok();
 
     println!("\n=== 管理员列表 ===");
     let mut stmt = match conn.prepare("SELECT id, username, real_name FROM admins") {
         Ok(s) => s,
-        Err(e) => {
-            println!("❌ 查询失败: {}", e);
-            return;
-        }
+        Err(e) => { println!("❌ 查询失败: {}", e); return; }
     };
 
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    });
+    let mut rows = match stmt.query([]) {
+        Ok(r) => r,
+        Err(e) => { println!("❌ 查询失败: {}", e); return; }
+    };
 
-    match rows {
-        Ok(rows) => {
-            let mut count = 0;
-            for row in rows {
-                match row {
-                    Ok((id, username, real_name)) => {
-                        let display_name = if real_name.is_empty() { "-" } else { &real_name };
-                        println!("  {}. {} ({})", id, username, display_name);
-                        count += 1;
-                    }
-                    Err(e) => {
-                        println!("  ⚠️  读取行失败: {}", e);
-                    }
-                }
-            }
-            if count == 0 {
-                println!("  暂无管理员");
-            }
-        }
-        Err(e) => {
-            println!("❌ 查询失败: {}", e);
-        }
+    let mut count = 0;
+    while let Ok(Some(row)) = rows.next() {
+        let id: i64 = row.get(0).unwrap_or(0);
+        let username: String = row.get(1).unwrap_or_default();
+        let real_name: String = row.get(2).unwrap_or_default();
+        let display = if real_name.is_empty() { "-" } else { &real_name };
+        println!("  {}. {} ({})", id, username, display);
+        count += 1;
     }
+    if count == 0 { println!("  暂无管理员"); }
 }
 
 fn do_update() {
@@ -600,6 +622,7 @@ fn do_update() {
     println!("\n=== 更新 Unicom ===");
     println!("安装目录: {}", install_dir);
     println!();
+
     #[cfg(target_os = "windows")]
     {
         println!("请在 PowerShell 中执行以下命令更新:");
@@ -608,21 +631,65 @@ fn do_update() {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        println!("请执行以下命令更新:");
-        println!("  curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/amuae/unicom/main/deploy.sh | sh");
+        println!("⚠️  更新将：");
+        println!("  1. 下载最新版本二进制");
+        println!("  2. 替换当前二进制");
+        println!("  3. 重启服务");
         println!();
-        print!("是否现在执行？(y/N): ");
+        println!("当前进程将在更新开始后退出，服务会自动重启。");
+        println!();
+        print!("确认更新？(y/N): ");
         io::stdout().flush().ok();
 
-        if read_line().to_lowercase() == "y" {
-            println!("正在更新...");
-            match std::process::Command::new("sh")
-                .args(["-c", "curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/amuae/unicom/main/deploy.sh | sh"])
-                .status()
-            {
-                Ok(status) if status.success() => println!("✅ 更新完成"),
-                Ok(status) => println!("⚠️  更新脚本退出码: {}", status.code().unwrap_or(-1)),
-                Err(e) => println!("❌ 执行更新脚本失败: {}", e),
+        if read_line().to_lowercase() != "y" {
+            println!("已取消");
+            return;
+        }
+
+        // 使用 systemd-run 将更新脚本作为独立 unit 执行
+        // 这样即使当前进程退出，更新也能完成
+        let update_cmd = format!(
+            "sleep 1 && systemctl stop unomic 2>/dev/null; \
+             curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/amuae/unicom/main/deploy.sh \
+             | bash -s -- --dir {}",
+            install_dir
+        );
+
+        // 尝试 systemd-run（最可靠）
+        let result = std::process::Command::new("systemd-run")
+            .args(["--unit=unicom-update", "--description=Unicom Update", "--no-ask-password",
+                   "bash", "-c", &update_cmd])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn();
+
+        match result {
+            Ok(_) => {
+                println!("✅ 更新任务已提交（systemd-run），当前进程退出。");
+                println!("  查看进度: journalctl -u unicom-update -f");
+                std::process::exit(0);
+            }
+            Err(_) => {
+                // systemd-run 不可用，用 nohup 方式
+                let result2 = std::process::Command::new("nohup")
+                    .args(["bash", "-c", &update_cmd])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .stdin(std::process::Stdio::null())
+                    .spawn();
+
+                match result2 {
+                    Ok(_) => {
+                        println!("✅ 更新任务已在后台启动（nohup），当前进程退出。");
+                        println!("  查看进度: tail -f /tmp/unicom-update.log");
+                        std::process::exit(0);
+                    }
+                    Err(e) => {
+                        println!("❌ 启动更新任务失败: {}", e);
+                        println!("  请手动执行:");
+                        println!("  curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/amuae/unicom/main/deploy.sh | sudo bash");
+                    }
+                }
             }
         }
     }
@@ -635,29 +702,53 @@ fn do_uninstall() {
     println!();
     println!("⚠️  此操作将：");
     println!("  - 停止服务");
+    println!("  - 删除 systemd 服务文件");
     println!("  - 删除所有文件（包括数据库）");
     println!();
     print!("确认卸载？(输入 yes): ");
     io::stdout().flush().ok();
 
-    if read_line() == "yes" {
-        cmd_stop();
-        println!("删除文件...");
-        match std::fs::remove_dir_all(&install_dir) {
-            Ok(_) => {}
-            Err(e) => println!("⚠️  删除文件失败: {}", e),
-        }
-
-        let service_script = "/data/adb/service.d/unicom.sh";
-        if std::path::Path::new(service_script).exists() {
-            std::fs::remove_file(service_script).ok();
-        }
-
-        println!("✅ 卸载完成");
-        std::process::exit(0);
-    } else {
+    if read_line() != "yes" {
         println!("已取消");
+        return;
     }
+
+    // 1. 停止服务
+    println!("停止服务...");
+    if is_systemd_managed() {
+        stop_via_systemd();
+        // 禁用 systemd 服务，防止重启
+        let _ = std::process::Command::new("systemctl")
+            .args(["disable", "unicom"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        // 删除 service 文件
+        let _ = std::fs::remove_file("/etc/systemd/system/unicom.service");
+        let _ = std::process::Command::new("systemctl")
+            .args(["daemon-reload"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    } else {
+        cmd_stop();
+    }
+
+    // Android service.d
+    let service_script = "/data/adb/service.d/unicom.sh";
+    if std::path::Path::new(service_script).exists() {
+        let _ = std::fs::remove_file(service_script);
+    }
+
+    // 2. 删除安装目录
+    println!("删除文件...");
+    match std::fs::remove_dir_all(&install_dir) {
+        Ok(_) => println!("✅ 文件已删除"),
+        Err(e) => println!("⚠️  删除文件失败: {} (进程仍在运行时部分文件可能无法删除)", e),
+    }
+
+    println!("✅ 卸载完成");
+    std::process::exit(0);
 }
 
 fn handle_admin_menu() {
@@ -666,8 +757,7 @@ fn handle_admin_menu() {
         match read_line().as_str() {
             "1" => cmd_reset_pass(),
             "2" => list_admins(),
-            "0" | "q" => break,
-            "" => break, // EOF
+            "0" | "q" | "" => break,
             _ => println!("无效选择"),
         }
     }
@@ -689,13 +779,9 @@ fn interactive_menu() {
                 println!("退出");
                 std::process::exit(0);
             }
-            "" => {
-                // EOF — 非交互环境，直接启动服务
-                break;
-            }
+            "" => break,
             _ => println!("无效选择"),
         }
-        // 操作完成后暂停，等待用户按回车
         print!("\n按回车返回菜单...");
         io::stdout().flush().ok();
         read_line();
@@ -715,10 +801,7 @@ async fn main() -> std::io::Result<()> {
 
     if args.len() > 1 {
         match args[1].as_str() {
-            "start" => {
-                cmd_start();
-                std::process::exit(0);
-            }
+            "start" => { cmd_start(); std::process::exit(0); }
             "stop" => cmd_stop(),
             "restart" => cmd_restart(),
             "status" => cmd_status(),
@@ -726,11 +809,7 @@ async fn main() -> std::io::Result<()> {
             "version" | "-v" | "--version" => cmd_version(),
             "help" | "-h" | "--help" => cmd_help(),
             "menu" => interactive_menu(),
-            _ => {
-                println!("未知命令: {}", args[1]);
-                cmd_help();
-                std::process::exit(1);
-            }
+            _ => { println!("未知命令: {}", args[1]); cmd_help(); std::process::exit(1); }
         }
         return Ok(());
     }
@@ -739,14 +818,11 @@ async fn main() -> std::io::Result<()> {
     
     if has_tty {
         interactive_menu();
-        // interactive_menu 只在用户选 0 时 exit，EOF 时 break 到这里
-        // break 后继续启动服务（用户从菜单选 start 后也会到这里）
     }
 
     // 加载配置
     let config = config::Config::load().expect("Failed to load config");
 
-    // 初始化日志
     let log_level = &config.log_level;
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -755,22 +831,16 @@ async fn main() -> std::io::Result<()> {
         )
         .init();
     
-    // 初始化数据库连接池
     let db = db::create_pool(&config.database_path);
     db::init_schema(&db);
     tracing::info!("Database pool initialized (max_size=10, WAL mode, busy_timeout=5s)");
 
-    // 加载静态文件
     let static_files = Arc::new(static_files::load_static_files());
     tracing::info!("Loaded {} static files", static_files.len());
 
-    // 创建速率限制器（10 次/分钟）
     let rate_limiter = Arc::new(Mutex::new(RateLimiter::new(10, 60)));
-
-    // 创建 session 缓存（30 秒 TTL，避免每次 admin 请求都查 DB）
     let session_cache = Arc::new(Mutex::new(handlers::auth::SessionCache::new(30)));
 
-    // 创建应用状态
     let app_state = AppState {
         db: db.clone(),
         config: config.clone(),
@@ -779,13 +849,11 @@ async fn main() -> std::io::Result<()> {
         session_cache: session_cache.clone(),
     };
 
-    // 启动定时任务
     let cron_state = app_state.clone();
     tokio::spawn(async move {
         cron::start_cron_jobs(cron_state).await;
     });
 
-    // 启动定期清理任务（每 5 分钟清理过期 session + rate limiter）
     let cleanup_rl = rate_limiter.clone();
     let cleanup_sc = session_cache.clone();
     let cleanup_db = db.clone();
@@ -793,31 +861,20 @@ async fn main() -> std::io::Result<()> {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
         loop {
             interval.tick().await;
-            {
-                let mut rl = cleanup_rl.lock().unwrap();
-                rl.cleanup();
-            }
-            {
-                let mut sc = cleanup_sc.lock().unwrap();
-                sc.cleanup();
-            }
+            { cleanup_rl.lock().unwrap().cleanup(); }
+            { cleanup_sc.lock().unwrap().cleanup(); }
             if let Ok(conn) = cleanup_db.get() {
-                let _ = conn.execute(
-                    "DELETE FROM admin_sessions WHERE expires_at < datetime('now')",
-                    [],
-                );
+                let _ = conn.execute("DELETE FROM admin_sessions WHERE expires_at < datetime('now')", []);
             }
         }
     });
 
-    // 写入 PID 文件
     let pid = std::process::id();
     std::fs::write("unicom.pid", pid.to_string()).ok();
 
     tracing::info!("Starting server at {}:{}", config.host, config.port);
     println!("Unicom v{} 启动成功 http://{}:{}", VERSION, config.host, config.port);
 
-    // 启动 HTTP 服务器
     let allowed_origins = config.notify.allowed_origins.clone();
     HttpServer::new(move || {
         let cors = if allowed_origins.is_empty() {
@@ -844,18 +901,14 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(app_state.clone()))
             .wrap(cors)
             .wrap(middleware::Logger::default())
-            // API 路由
             .service(handlers::auth::login)
             .service(handlers::auth::register)
             .service(handlers::auth::user_login)
             .service(handlers::auth::user_register)
-            // 查询
             .service(handlers::query::query_flow)
             .service(handlers::query::query_balance)
-            // 用户配置
             .service(handlers::user::get_user_config)
             .service(handlers::user::update_user_config)
-            // 管理后台
             .service(handlers::admin::get_users)
             .service(handlers::admin::get_user_detail)
             .service(handlers::admin::add_user)
@@ -863,21 +916,17 @@ async fn main() -> std::io::Result<()> {
             .service(handlers::admin::delete_user)
             .service(handlers::admin::toggle_user_status)
             .service(handlers::admin::get_logs)
-            // 日志管理
             .service(handlers::admin::get_log_config)
             .service(handlers::admin::save_log_config)
             .service(handlers::admin::clean_logs)
-            // 定时管理
             .service(handlers::admin::get_cron_tasks)
             .service(handlers::admin::create_or_update_cron)
             .service(handlers::admin::toggle_cron)
             .service(handlers::admin::delete_cron)
-            // 系统管理
             .service(handlers::admin::get_system_config)
             .service(handlers::admin::change_admin_password)
             .service(handlers::admin::update_admin_username)
             .service(handlers::admin::toggle_guest_register)
-            // 用户 API 端点
             .service(handlers::user_api::query_page_data)
             .service(handlers::user_api::reset_baseline)
             .service(handlers::user_api::get_user_config)
@@ -885,9 +934,7 @@ async fn main() -> std::io::Result<()> {
             .service(handlers::user_api::test_notify)
             .service(handlers::user_api::serve_page)
             .service(handlers::user_api::delete_user_by_token)
-            // 版本
             .route("/version", web::get().to(get_version))
-            // 静态文件
             .route("/", web::get().to(serve_index))
             .route("/{path:.*}", web::get().to(serve_static))
     })
@@ -897,16 +944,12 @@ async fn main() -> std::io::Result<()> {
 }
 
 async fn get_version() -> HttpResponse {
-    HttpResponse::Ok().json(serde_json::json!({
-        "version": VERSION
-    }))
+    HttpResponse::Ok().json(serde_json::json!({ "version": VERSION }))
 }
 
 async fn serve_index(state: web::Data<AppState>) -> HttpResponse {
     if let Some(file) = state.static_files.get("index.html") {
-        HttpResponse::Ok()
-            .content_type(file.content_type)
-            .body(file.content)
+        HttpResponse::Ok().content_type(file.content_type).body(file.content)
     } else {
         HttpResponse::NotFound().body("Not Found")
     }
@@ -914,18 +957,11 @@ async fn serve_index(state: web::Data<AppState>) -> HttpResponse {
 
 async fn serve_static(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     let path = req.match_info().get("path").unwrap_or("");
-    
     if let Some(file) = state.static_files.get(path) {
-        HttpResponse::Ok()
-            .content_type(file.content_type)
-            .body(file.content)
+        HttpResponse::Ok().content_type(file.content_type).body(file.content)
+    } else if let Some(file) = state.static_files.get("index.html") {
+        HttpResponse::Ok().content_type(file.content_type).body(file.content)
     } else {
-        if let Some(file) = state.static_files.get("index.html") {
-            HttpResponse::Ok()
-                .content_type(file.content_type)
-                .body(file.content)
-        } else {
-            HttpResponse::NotFound().body("Not Found")
-        }
+        HttpResponse::NotFound().body("Not Found")
     }
 }
