@@ -199,6 +199,13 @@ jobs:
         if: matrix.target != 'aarch64-linux-android'
         run: cargo install cross --version 0.2.5
 
+      - name: Setup Android NDK
+        if: matrix.target == 'aarch64-linux-android'
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r26c
+
       - name: Install cargo-ndk (Android)
         if: matrix.target == 'aarch64-linux-android'
         run: cargo install cargo-ndk
