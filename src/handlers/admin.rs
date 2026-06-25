@@ -159,8 +159,7 @@ pub async fn get_users(
             success: false, data: None, error: Some(format!("查询失败: {}", e)), total: None,
         }),
     };
-
-    let users: Vec<serde_json::Value> = stmt.query_map([], |row| {
+    let users: Vec<serde_json::Value> = match stmt.query_map([], |row| {
         Ok(serde_json::json!({
             "id": row.get::<_, i64>(0)?,
             "mobile": row.get::<_, String>(1)?,
@@ -174,10 +173,15 @@ pub async fn get_users(
             "last_query_at": row.get::<_, Option<String>>(9)?,
             "created_at": row.get::<_, String>(10)?,
         }))
-    })
-    .unwrap()
-    .filter_map(|r| r.ok())
-    .collect();
+    }) {
+        Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),
+        Err(e) => return HttpResponse::InternalServerError().json(AdminResponse {
+            success: false,
+            data: None,
+            error: Some(format!("查询失败: {}", e)),
+            total: None,
+        }),
+    };
 
     HttpResponse::Ok().json(AdminResponse {
         success: true,
@@ -619,22 +623,26 @@ pub async fn get_logs(
             success: false, data: None, error: Some(format!("查询失败: {}", e)), total: None,
         }),
     };
-
-    let logs: Vec<serde_json::Value> = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+    let logs: Vec<serde_json::Value> = match stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
         Ok(serde_json::json!({
             "id": row.get::<_, i64>(0)?,
-            "log_type": row.get::<_, String>(1)?,
-            "log_level": row.get::<_, String>(2)?,
+            "module": row.get::<_, String>(1)?,
+            "level": row.get::<_, String>(2)?,
             "message": row.get::<_, String>(3)?,
-            "context": row.get::<_, Option<String>>(4)?,
-            "user_id": row.get::<_, Option<i64>>(5)?,
-            "ip_address": row.get::<_, Option<String>>(6)?,
+            "user_id": row.get::<_, Option<i64>>(4)?,
+            "admin_id": row.get::<_, Option<i64>>(5)?,
+            "ip": row.get::<_, Option<String>>(6)?,
             "created_at": row.get::<_, String>(7)?,
         }))
-    })
-    .unwrap()
-    .filter_map(|r| r.ok())
-    .collect();
+    }) {
+        Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),
+        Err(e) => return HttpResponse::InternalServerError().json(AdminResponse {
+            success: false,
+            data: None,
+            error: Some(format!("查询失败: {}", e)),
+            total: None,
+        }),
+    };
 
     // Get total count
     let total: i64 = {
@@ -802,7 +810,7 @@ pub async fn get_cron_tasks(
         }),
     };
 
-    let tasks: Vec<serde_json::Value> = stmt.query_map([], |row| {
+    let tasks: Vec<serde_json::Value> = match stmt.query_map([], |row| {
         Ok(serde_json::json!({
             "id": row.get::<_, i64>(0)?,
             "user_id": row.get::<_, i64>(1)?,
@@ -818,10 +826,15 @@ pub async fn get_cron_tasks(
             "failed_runs": row.get::<_, i64>(11)?,
             "created_at": row.get::<_, String>(12)?,
         }))
-    })
-    .unwrap()
-    .filter_map(|r| r.ok())
-    .collect();
+    }) {
+        Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),
+        Err(e) => return HttpResponse::InternalServerError().json(AdminResponse {
+            success: false,
+            data: None,
+            error: Some(format!("查询失败: {}", e)),
+            total: None,
+        }),
+    };
 
     HttpResponse::Ok().json(AdminResponse {
         success: true, data: Some(serde_json::json!(tasks)), error: None, total: None,
